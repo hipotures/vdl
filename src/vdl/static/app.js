@@ -97,7 +97,8 @@ function renderState(state) {
     $(".badge", card).textContent = { downloading: "Downloading", finishing: "Finishing · disabled", queued: "Pending", active: "Active", inactive: "Disabled" }[row.state];
     $(".last-check", card).textContent = `Last attempt: ${age(row.last_check, state.time)}`;
     const busy = pendingActions.has(row.id);
-    $(".download", card).disabled = busy || !row.active || ["downloading", "queued"].includes(row.state);
+    $(".download", card).disabled =
+      busy || !row.active || row.state === "downloading" || row.download_requested;
     $(".disable", card).disabled = busy || !row.active;
     $(".confirm-disable", card).disabled = busy;
     if (!row.active) $(".confirm", card).hidden = true;
