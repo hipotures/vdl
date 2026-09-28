@@ -15,8 +15,9 @@ vdl install
 ```
 
 Installation creates configuration if absent and starts `vdl.service` (the
-terminal and single scheduler in a dedicated tmux server) and
-`vdl-web.service` (HTTP only). Neither service requires root.
+headless single scheduler) and `vdl-web.service` (HTTP only). The Rich TUI is
+a client: `vdl attach` creates or attaches its tmux session only from an
+interactive terminal. Neither service requires root.
 
 For an existing installation, let the current download finish before restarting:
 
@@ -60,8 +61,8 @@ change `check_interval` or `minimum_spacing` for recurring checks.
 ## CLI and terminal
 
 ```console
-vdl                       # run the owner terminal application
-vdl attach                # attach to the persistent owner in tmux
+vdl                       # run a Rich TUI client in the current terminal
+vdl attach                # create or attach the persistent Rich TUI in tmux
 vdl list
 vdl add https://www.youtube.com/@example
 vdl del 2,4 7
@@ -88,9 +89,10 @@ while another source is downloading.
 | `a`, `n`, `d`, `r`, `q` outside the URL field | Add, download now, disable, refresh, quit |
 
 Use `vdl --no-mouse` or `VDL_MOUSE=0 vdl` when a terminal has incompatible mouse
-reporting. The normal `Ctrl-b d` tmux shortcut also detaches. Exiting the owner
-ends its current downloader; systemd restarts the owner after about ten seconds.
-An explicit `systemctl --user stop vdl` remains stopped.
+reporting. The normal `Ctrl-b d` tmux shortcut also detaches. Closing or
+crashing the TUI does not affect the scheduler or the current downloader;
+`vdl.service` owns those independently. An explicit
+`systemctl --user stop vdl` stops the scheduler.
 
 ## Web and phone workflow
 
