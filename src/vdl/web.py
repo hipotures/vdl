@@ -80,6 +80,7 @@ def create_app(config: Config) -> web.Application:
     for route, name, mime in [("/", "index.html", "text/html"),
                               ("/app.css", "app.css", "text/css"),
                               ("/app.js", "app.js", "text/javascript"),
+                              ("/sort.js", "sort.js", "text/javascript"),
                               ("/url.js", "url.js", "text/javascript")]:
         app.router.add_get(route, asset(name, mime))
     app.router.add_get("/api/state", state)

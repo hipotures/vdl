@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { normalizeURL, age } from "../src/vdl/static/url.js";
+import { sortSources } from "../src/vdl/static/sort.js";
 
 test("query stripping keeps the exact profile URL", () => {
   assert.equal(normalizeURL("  https://www.youtube.com/@test?si=a&b=2  "), "https://www.youtube.com/@test");
@@ -17,4 +18,14 @@ test("age handles missing, recent and future timestamps", () => {
   assert.equal(age(90, 100), "10s ago");
   assert.equal(age(101, 100), "0s ago");
   assert.equal(age(0, 3600), "1h ago");
+});
+test("sources can be sorted by newest check or account name", () => {
+  const sources = [
+    { id: "youtube/Zulu", service: "YouTube", account: "Zulu", last_check: 20, state: "downloading" },
+    { id: "tiktok/alpha", service: "TikTok", account: "alpha", last_check: null, state: "queued" },
+    { id: "instagram/beta", service: "Instagram", account: "beta", last_check: 30, state: "active" },
+  ];
+  assert.deepEqual(sortSources(sources, "date").map((source) => source.account), ["Zulu", "beta", "alpha"]);
+  assert.deepEqual(sortSources(sources, "name").map((source) => source.account), ["alpha", "beta", "Zulu"]);
+  assert.deepEqual(sources.map((source) => source.account), ["Zulu", "alpha", "beta"]);
 });

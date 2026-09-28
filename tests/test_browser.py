@@ -67,7 +67,8 @@ async def load_ui(page, server):
         }, configurable: true});
     """)
     code = (ASSETS / "url.js").read_text().replace("export function", "function")
-    code += "\n" + (ASSETS / "app.js").read_text().replace('import { normalizeURL, age } from "./url.js";', "")
+    code += "\n" + (ASSETS / "sort.js").read_text().replace("export function", "function")
+    code += "\n" + (ASSETS / "app.js").read_text().replace('import { normalizeURL, age } from "./url.js";', "").replace('import { sortSources } from "./sort.js";', "")
     await page.add_script_tag(content="{\n" + code + "\n}")
 
 
@@ -84,7 +85,7 @@ async def network_mode(page, offline):
 async def test_mobile_first_add_live_updates_and_sticky_composer(tmp_path, width, height):
     cfg = Config(download_root=tmp_path / "downloads", log_file=tmp_path / "web.log", web_host="127.0.0.1")
     repo = SourceRepository(cfg.download_root)
-    current = repo.add_source("https://www.youtube.com/@northlight").source
+    current = repo.add_source("https://www.youtube.com/@zz-northlight").source
     (current.path / ".last-check").touch()
     for number in range(18):
         source = repo.add_source(f"https://www.instagram.com/studio-{number:02}").source
@@ -104,6 +105,10 @@ async def test_mobile_first_add_live_updates_and_sticky_composer(tmp_path, width
                 page.on("console", lambda item: errors.append(item.text) if item.type == "error" else None)
                 await load_ui(page, server)
                 await expect(page.locator("#connection")).to_have_text("Live · 1s")
+                await expect(page.locator(".source").first.locator(".account")).to_have_text("zz-northlight")
+                await page.locator('[data-sort="name"]').click()
+                await expect(page.locator(".source").first.locator(".account")).to_have_text("studio-00")
+                await page.locator('[data-sort="date"]').click()
                 assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
                 assert (await page.locator("#add").bounding_box())["y"] < height
                 url = "https://www.tiktok.com/@" + "long-profile-" * 8

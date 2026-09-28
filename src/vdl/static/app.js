@@ -1,10 +1,25 @@
 import { normalizeURL, age } from "./url.js";
+import { sortSources } from "./sort.js";
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const input = $("#source-url"), add = $("#add"), preview = $("#url-preview");
 const cards = new Map(), pendingActions = new Set();
 let adding = false, lastState = null, lastTime = -Infinity;
 let inFlight = null, timer = null, epoch = 0;
+let sortMode = "date";
+
+function setSortMode(mode) {
+  sortMode = mode;
+  document.querySelectorAll("#sort button").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.sort === mode));
+  });
+  if (lastState) renderState(lastState);
+}
+
+$("#sort").addEventListener("click", (event) => {
+  const mode = event.target.closest("button")?.dataset.sort;
+  if (mode) setSortMode(mode);
+});
 
 function message(text, error = false) {
   $("#message").textContent = text;
@@ -77,7 +92,7 @@ function renderState(state) {
   if (state.time < lastTime) return; // A slower response must not undo a newer mutation.
   lastTime = state.time; lastState = state;
   const container = $("#sources"), keep = new Set();
-  state.sources.forEach((row, index) => {
+  sortSources(state.sources, sortMode).forEach((row, index) => {
     keep.add(row.id);
     let card = cards.get(row.id);
     if (!card) {
