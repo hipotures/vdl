@@ -243,6 +243,16 @@ async def test_terminal_detach_uses_existing_tmux_server(tmp_path, monkeypatch):
     assert calls == [(["tmux", "-L", "vdl", "detach-client", "-s", "main"], True)]
 
 
+def test_attach_builds_interactive_tui_session(tmp_path, monkeypatch):
+    tmux_config = tmp_path / "tmux.conf"
+    tmux_config.write_text("set-option -g exit-empty on\n")
+    monkeypatch.setattr(cli, "TMUX_CONFIG_PATH", tmux_config)
+    monkeypatch.setattr(cli, "_vdl_command", lambda: ["/opt/vdl/bin/vdl"])
+    argv = cli._attach_argv()
+    assert argv[:6] == ["tmux", "-L", "vdl", "-f", str(tmux_config), "new-session"]
+    assert argv[6:10] == ["-A", "-s", "main", "/opt/vdl/bin/vdl --tui-client"]
+
+
 def test_cli_command_contract(tmp_path, monkeypatch, capsys):
     cfg = config(tmp_path)
     monkeypatch.setattr(cli, "load_config", lambda: cfg)
