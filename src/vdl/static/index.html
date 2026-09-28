@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#f4f6f8">
+  <title>vdl · Sources</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="masthead"><a href="/" class="brand">vdl<span>Source manager</span></a><span id="connection" role="status">Connecting…</span></header>
+  <main>
+    <section class="composer" aria-labelledby="add-title">
+      <h1 id="add-title">Add a source</h1>
+      <form id="add-form" novalidate>
+        <label for="source-url" class="sr-only">Source URL</label>
+        <input id="source-url" name="url" type="text" inputmode="url" enterkeyhint="go" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="4096" placeholder="Paste a profile or channel URL" aria-describedby="url-preview">
+        <div class="add-buttons"><button id="paste" type="button" class="secondary">Paste from clipboard</button><button id="add" type="submit" disabled>Add source</button></div>
+        <p id="url-preview" class="preview">Tracking parameters are removed before saving.</p>
+      </form>
+      <p id="message" class="message" role="status" aria-live="polite"></p>
+    </section>
+    <section class="activity" aria-label="Downloader status"><span class="activity-dot" aria-hidden="true"></span><p id="activity">Loading downloader status…</p></section>
+    <section aria-labelledby="sources-title">
+      <div class="section-heading"><h2 id="sources-title">Sources <span id="count">0</span></h2><button id="refresh" type="button" class="secondary small">Refresh</button></div>
+      <p id="empty" class="empty">No sources yet. Paste a URL above to get started.</p>
+      <div id="sources" class="sources"></div>
+    </section>
+    <p class="footnote">One download at a time. You can keep adding sources while a download runs.</p>
+  </main>
+  <template id="source-template">
+    <article class="source">
+      <div class="source-heading"><span class="service"></span><span class="badge"></span></div>
+      <h3 class="account"></h3>
+      <p class="last-check"></p>
+      <div class="source-actions"><button type="button" class="secondary download">Download now</button><button type="button" class="secondary disable">Disable</button></div>
+      <div class="confirm" hidden><p>Disable future downloads? Existing files are kept. A running download will finish.</p><div class="source-actions"><button type="button" class="danger confirm-disable">Disable source</button><button type="button" class="secondary cancel-disable">Cancel</button></div></div>
+    </article>
+  </template>
+  <noscript>This interface needs JavaScript. The vdl command-line interface remains available.</noscript>
+</body>
+</html>

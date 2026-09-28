@@ -1,4 +1,4 @@
-"""Shared application operations used by CLI, Textual, and the scheduler."""
+"""Shared application operations used by CLI, terminal, HTTP, and the scheduler."""
 
 from __future__ import annotations
 

@@ -10,13 +10,12 @@ from .config import ConfigError, load_config
 from .domain import add_source, disable_sources, format_age, list_sources, resolve_source_numbers
 from .install import deinstall_services, install_services
 from .repository import Source, SourceRepository, display_service
-from .runtime import OWNER_LOCK, file_lock, set_busy
-from .ui import VdlApp
-from .web import serve
+from .runtime import DOWNLOAD_LOCK, OWNER_LOCK, file_lock, lock_is_held, set_busy
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vdl")
+    parser.add_argument("--no-mouse", action="store_true", help="start the terminal without mouse capture (F2 toggles it)")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("attach", help="attach to the persistent tmux session")
     subparsers.add_parser("list", help="list sources")
@@ -32,13 +31,8 @@ def _parser() -> argparse.ArgumentParser:
 def _source_rows(sources: list[Source], numbers: list[int] | None = None) -> list[list[str]]:
     numbers = numbers or list(range(1, len(sources) + 1))
     return [
-        [
-            str(number),
-            display_service(source.service),
-            source.account,
-            format_age(source.last_check),
-            "active" if source.active else "inactive",
-        ]
+        [str(number), display_service(source.service), source.account,
+         format_age(source.last_check), "active" if source.active else "inactive"]
         for number, source in zip(numbers, sources, strict=True)
     ]
 
@@ -82,13 +76,10 @@ def _disable(repository: SourceRepository, ids: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if arguments in (["--web-client"], ["--serve-web"]):
+    if arguments == ["--serve-web"]:
+        from .web import serve
         try:
-            config = load_config()
-            if arguments == ["--web-client"]:
-                VdlApp(config, owner=False).run()
-            else:
-                serve(config)
+            serve(load_config())
             return 0
         except (ConfigError, OSError, ValueError) as exc:
             print(f"vdl: {exc}", file=sys.stderr)
@@ -107,10 +98,12 @@ def main(argv: list[str] | None = None) -> int:
         repository = SourceRepository(config.download_root)
         match args.command:
             case None:
+                from .ui import VdlApp
                 try:
                     with file_lock(OWNER_LOCK, blocking=False):
-                        set_busy(None)
-                        VdlApp(config, owner=True).run(mouse=False)
+                        if not lock_is_held(DOWNLOAD_LOCK):
+                            set_busy(None)
+                        VdlApp(config, owner=True).run(mouse=False if args.no_mouse else None)
                 except BlockingIOError as exc:
                     raise RuntimeError("another vdl owner is already running") from exc
             case "list":

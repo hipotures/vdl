@@ -5,23 +5,22 @@ build-backend = "hatchling.build"
 [project]
 name = "vdl"
 version = "0.1.0"
-description = "A small Textual application for recurring yt-dlp downloads"
+description = "Recurring yt-dlp downloads with a Rich terminal and mobile web interface"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "CC0-1.0"
 dependencies = [
-    "textual>=8.2,<9",
-    "textual-serve>=1.1,<2",
+    "aiohttp>=3.13,<4",
+    "prompt-toolkit>=3.0.52,<4",
+    "rich>=14,<16",
 ]
 
 [project.scripts]
 vdl = "vdl.cli:main"
 
 [dependency-groups]
-dev = [
-    "pytest>=8.4,<10",
-    "pytest-asyncio>=1.2,<2",
-]
+dev = ["pytest>=8.4,<10", "pytest-asyncio>=1.2,<2"]
+browser = ["playwright>=1.57,<2"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

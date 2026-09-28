@@ -67,7 +67,7 @@ WantedBy=default.target
 
 def web_unit_text(application_command: Sequence[str]) -> str:
     return f"""[Unit]
-Description=vdl Textual web interface
+Description=vdl mobile web interface
 After=network-online.target
 Wants=network-online.target
 

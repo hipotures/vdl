@@ -56,3 +56,19 @@ def read_busy() -> str | None:
         return BUSY_FILE.read_text(encoding="utf-8").strip() or None
     except (OSError, UnicodeError):
         return None
+
+
+DOWNLOAD_LOCK = RUNTIME_DIR / "download.lock"
+
+
+def lock_is_held(path: Path) -> bool:
+    """Check liveness without trusting a potentially stale status file."""
+    try:
+        with file_lock(path, blocking=False):
+            return False
+    except BlockingIOError:
+        return True
+
+
+def current_download() -> str | None:
+    return read_busy() if lock_is_held(DOWNLOAD_LOCK) else None

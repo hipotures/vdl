@@ -75,7 +75,7 @@ class YtDlpRunner:
             raise ValueError("yt_dlp_command must not be empty")
         self.logger = logger or get_logger(log_file or DEFAULT_LOG_FILE)
 
-    async def run(self, source: Source) -> int:
+    async def run(self, source: Source, *, pass_fds: tuple[int, ...] = ()) -> int:
         """Run yt-dlp for ``source`` and return its process exit code.
 
         A missing executable, invalid working directory, or another launch
@@ -99,6 +99,8 @@ class YtDlpRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
+                # Keep the global download lock alive if the owner crashes.
+                pass_fds=pass_fds,
             )
         except asyncio.CancelledError:
             self.logger.info("yt-dlp launch cancelled source=%s", source_path)
