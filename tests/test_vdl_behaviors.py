@@ -237,14 +237,19 @@ def test_owner_lock_is_process_wide():
     assert result.returncode == 3
 
 
-def test_generated_units_keep_vdl_tmux_and_restart_contract(tmp_path):
+def test_generated_units_separate_owner_from_client_tmux(tmp_path):
     tmux = tmp_path / "tmux.conf"
-    _write_tmux_config(tmux, ["/opt/vdl/bin/vdl"])
-    owner, web = owner_unit_text(tmux), web_unit_text(["/opt/vdl/bin/vdl"])
-    assert "exit-empty on" in tmux.read_text() and "new-session -d -s main" in tmux.read_text()
-    assert "exec /opt/vdl/bin/vdl" in tmux.read_text()
-    for value in ["-L vdl", "-D", f"-f {tmux}", "Restart=always", "RestartSec=10"]:
-        assert value in owner
+    application = ["/opt/vdl/bin/vdl"]
+    _write_tmux_config(tmux, application)
+    owner, web = owner_unit_text(application), web_unit_text(application)
+    tmux_text = tmux.read_text()
+    assert "exit-empty on" in tmux_text
+    assert "exit-unattached off" in tmux_text
+    assert "new-session" not in tmux_text
+    assert "tmux" not in owner
+    assert "ExecStart=/opt/vdl/bin/vdl --owner-daemon" in owner
+    assert "KillMode=control-group" in owner
+    assert "Restart=always" in owner and "RestartSec=10" in owner
     assert "--serve-web" in web and "Restart=always" in web
 
 
