@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
+import shlex
 import sys
 
 from .config import ConfigError, load_config
 from .domain import add_source, disable_sources, format_age, list_sources, resolve_source_numbers
-from .install import deinstall_services, install_services
+from .install import TMUX_CONFIG_PATH, _vdl_command, deinstall_services, install_services
 from .repository import Source, SourceRepository, display_service
-from .runtime import DOWNLOAD_LOCK, OWNER_LOCK, file_lock, lock_is_held, set_busy
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vdl")
-    parser.add_argument("--no-mouse", action="store_true", help="start the terminal without mouse capture (F2 toggles it)")
+    parser.add_argument(
+        "--no-mouse",
+        action="store_true",
+        help="start the terminal without mouse capture (F2 toggles it)",
+    )
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("attach", help="attach to the persistent tmux session")
+    subparsers.add_parser("attach", help="open or attach to the persistent Rich TUI")
     subparsers.add_parser("list", help="list sources")
     add_parser = subparsers.add_parser("add", help="add a source")
     add_parser.add_argument("url")
@@ -31,8 +36,13 @@ def _parser() -> argparse.ArgumentParser:
 def _source_rows(sources: list[Source], numbers: list[int] | None = None) -> list[list[str]]:
     numbers = numbers or list(range(1, len(sources) + 1))
     return [
-        [str(number), display_service(source.service), source.account,
-         format_age(source.last_check), "active" if source.active else "inactive"]
+        [
+            str(number),
+            display_service(source.service),
+            source.account,
+            format_age(source.last_check),
+            "active" if source.active else "inactive",
+        ]
         for number, source in zip(numbers, sources, strict=True)
     ]
 
@@ -40,13 +50,19 @@ def _source_rows(sources: list[Source], numbers: list[int] | None = None) -> lis
 def print_sources(sources: list[Source], numbers: list[int] | None = None) -> None:
     headers = ["#", "Service", "Account", "Last check", "State"]
     rows = _source_rows(sources, numbers)
-    widths = [
-        max(len(headers[column]), *(len(row[column]) for row in rows))
-        for column in range(len(headers))
-    ] if rows else [len(header) for header in headers]
+    widths = (
+        [
+            max(len(headers[column]), *(len(row[column]) for row in rows))
+            for column in range(len(headers))
+        ]
+        if rows
+        else [len(header) for header in headers]
+    )
 
     def line(values: list[str]) -> str:
-        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(values)).rstrip()
+        return "  ".join(
+            value.ljust(widths[index]) for index, value in enumerate(values)
+        ).rstrip()
 
     print(line(headers))
     for row in rows:
@@ -74,38 +90,79 @@ def _disable(repository: SourceRepository, ids: list[str]) -> int:
     return 0
 
 
+def _attach_argv() -> list[str]:
+    """Create the Rich TUI from the interactive terminal, never from systemd."""
+
+    command = shlex.join([*_vdl_command(), "--tui-client"])
+    argv = ["tmux", "-L", "vdl"]
+    if Path(TMUX_CONFIG_PATH).is_file():
+        argv.extend(["-f", str(TMUX_CONFIG_PATH)])
+    argv.extend(["new-session", "-A", "-s", "main", command])
+    return argv
+
+
+def _run_tui(*, mouse: bool | None = None) -> None:
+    from .ui import VdlApp
+
+    VdlApp(load_config(), owner=False).run(mouse=mouse)
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+
     if arguments == ["--serve-web"]:
         from .web import serve
+
         try:
             serve(load_config())
             return 0
         except (ConfigError, OSError, ValueError) as exc:
             print(f"vdl: {exc}", file=sys.stderr)
             return 2
+
+    if arguments == ["--owner-daemon"]:
+        from .owner import run_owner
+
+        try:
+            run_owner(load_config())
+            return 0
+        except (ConfigError, OSError, RuntimeError, ValueError) as exc:
+            print(f"vdl: {exc}", file=sys.stderr)
+            return 2
+
+    if arguments == ["--tui-client"]:
+        try:
+            _run_tui()
+            return 0
+        except (ConfigError, OSError, RuntimeError, ValueError) as exc:
+            print(f"vdl: {exc}", file=sys.stderr)
+            return 2
+
     args = _parser().parse_args(arguments)
     try:
         if args.command == "attach":
-            os.execvp("tmux", ["tmux", "-L", "vdl", "attach-session", "-t", "main"])
+            environment = os.environ.copy()
+            if args.no_mouse:
+                environment["VDL_MOUSE"] = "0"
+            command = _attach_argv()
+            os.execvpe(command[0], command, environment)
+
         if args.command == "deinstall":
             deinstall_services()
             return 0
         if args.command == "install":
             install_services()
             return 0
+
         config = load_config()
         repository = SourceRepository(config.download_root)
         match args.command:
             case None:
                 from .ui import VdlApp
-                try:
-                    with file_lock(OWNER_LOCK, blocking=False):
-                        if not lock_is_held(DOWNLOAD_LOCK):
-                            set_busy(None)
-                        VdlApp(config, owner=True).run(mouse=False if args.no_mouse else None)
-                except BlockingIOError as exc:
-                    raise RuntimeError("another vdl owner is already running") from exc
+
+                VdlApp(config, owner=False).run(
+                    mouse=False if args.no_mouse else None
+                )
             case "list":
                 print_sources(list_sources(repository))
             case "add":
