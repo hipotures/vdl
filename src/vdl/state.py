@@ -22,6 +22,7 @@ def snapshot(repository: SourceRepository) -> dict:
             rows.append({"id": source.id, "service": display_service(source.service),
                          "account": source.account, "url": source.url,
                          "active": source.active, "state": state,
+                         "download_requested": source.download_requested,
                          "last_check": source.last_check})
     return {"sources": rows, "download": busy, "owner_running": lock_is_held(OWNER_LOCK),
             "pending": sum(row["state"] == "queued" for row in rows), "time": timestamp}
