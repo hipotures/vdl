@@ -46,16 +46,14 @@ def _exec_line(arguments: Sequence[str]) -> str:
     return shlex.join(arguments)
 
 
-def owner_unit_text(tmux_config: Path) -> str:
-    tmux = shutil.which("tmux") or "/usr/bin/tmux"
+def owner_unit_text(application_command: Sequence[str]) -> str:
     return f"""[Unit]
-Description=vdl owner application
+Description=vdl download scheduler
 After=default.target
 
 [Service]
 Type=simple
-ExecStart={_exec_line([tmux, '-L', 'vdl', '-f', str(tmux_config), '-D'])}
-ExecStop={_exec_line([tmux, '-L', 'vdl', 'kill-server'])}
+ExecStart={_exec_line([*application_command, '--owner-daemon'])}
 KillMode=control-group
 Restart=always
 RestartSec=10
@@ -83,12 +81,12 @@ WantedBy=default.target
 
 
 def _write_tmux_config(path: Path, application_command: Sequence[str]) -> None:
-    shell_command = shlex.join(["exec", *application_command])
+    """Write policy for the client-only tmux server used by vdl attach."""
+
+    del application_command
     path.write_text(
         "set-option -g exit-empty on\n"
-        "set-option -g exit-unattached off\n"
-        f"new-session -d -s main {shlex.quote(shell_command)}\n"
-        "set-option -g exit-empty on\n",
+        "set-option -g exit-unattached off\n",
         encoding="utf-8",
     )
 
@@ -118,13 +116,15 @@ def install_services(
 
     owner = unit_dir / OWNER_UNIT_NAME
     web = unit_dir / WEB_UNIT_NAME
-    owner.write_text(owner_unit_text(tmux_config), encoding="utf-8")
+    owner.write_text(owner_unit_text(application_command), encoding="utf-8")
     web.write_text(web_unit_text(application_command), encoding="utf-8")
 
     _systemctl(["daemon-reload"], runner)
     _systemctl(["enable", "--now", OWNER_UNIT_NAME, WEB_UNIT_NAME], runner)
 
-    display_host = "localhost" if config.web_host in {"0.0.0.0", "::"} else config.web_host
+    display_host = (
+        "localhost" if config.web_host in {"0.0.0.0", "::"} else config.web_host
+    )
     print(f"Config: {config_path}")
     print(f"Owner status: systemctl --user status {OWNER_UNIT_NAME}")
     print(f"Web status: systemctl --user status {WEB_UNIT_NAME}")
@@ -138,7 +138,9 @@ def deinstall_services(
 ) -> None:
     """Stop the services and remove only vdl's installed unit files."""
 
-    _systemctl(["disable", "--now", OWNER_UNIT_NAME, WEB_UNIT_NAME], runner, check=False)
+    _systemctl(
+        ["disable", "--now", OWNER_UNIT_NAME, WEB_UNIT_NAME], runner, check=False
+    )
     for name in (OWNER_UNIT_NAME, WEB_UNIT_NAME):
         (unit_dir / name).unlink(missing_ok=True)
     _systemctl(["daemon-reload"], runner)
