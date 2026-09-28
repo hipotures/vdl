@@ -55,15 +55,17 @@ $ vdl add https://www.youtube.com/@example
 $ vdl del 2,4 7
 ```
 
-Detach from tmux with `Ctrl-b d`; the scheduler continues running. Choosing
-Quit ends the tmux session, and systemd starts a fresh owner after about ten
-seconds. An explicit `systemctl --user stop vdl` remains stopped.
+Use the **Detach** button to leave tmux while the scheduler continues running.
+`Ctrl-b d` does the same when the surrounding terminal passes tmux shortcuts.
+Choosing Quit ends the tmux session, and systemd starts a fresh owner after
+about ten seconds. An explicit `systemctl --user stop vdl` remains stopped.
 
 The browser interface listens on `web_host:web_port`. With the default bind
 address, open `http://HOSTNAME:8780` from the trusted local network, replacing
 `HOSTNAME` with the machine's resolvable name or LAN address. Browser sessions
-are client-only: they may list, add, and disable sources, but never start a
-second scheduler or downloader.
+are client-only: they may list, add, disable, and queue a selected source with
+**Download now**, but never start a second scheduler or downloader. The owner
+scheduler processes queued downloads sequentially.
 
 `vdl del` accepts whitespace, commas, semicolons, or mixtures of them. It
 resolves the temporary numbers against the current sorted list, shows the
@@ -74,7 +76,9 @@ active sources it will disable, and asks once before changing their markers.
 An active source has `SERVICE/ACCOUNT/.source`; an inactive one has
 `.source.del`. The marker contains the source URL. `.archive` belongs to
 `yt-dlp`, and the mtime of `.last-check` records when the latest attempt
-started. Directories without either source marker are ignored.
+started. A temporary `.download-now` marker queues an immediate check and is
+removed when that attempt starts. Directories without either source marker are
+ignored.
 
 Disabling a source only renames `.source` to `.source.del`. Media, archives,
 attempt markers, and account directories remain in place. The local directory

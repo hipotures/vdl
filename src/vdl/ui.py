@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import subprocess
+
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Static
 
 from .config import Config
-from .domain import add_source, disable_sources, format_age, list_sources
+from .domain import (
+    add_source,
+    disable_sources,
+    format_age,
+    list_sources,
+    request_download,
+)
 from .repository import Source, SourceRepository, display_service
 from .runtime import read_busy
 from .scheduler import Scheduler
@@ -95,6 +103,7 @@ class VdlApp(App[None]):
         self.repository = SourceRepository(config.download_root)
         self.sources: list[Source] = []
         self.scheduler: Scheduler | None = None
+        self._last_busy_label: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("vdl sources", id="title")
@@ -103,6 +112,9 @@ class VdlApp(App[None]):
         with Horizontal(id="actions"):
             yield Button("Add", id="add", variant="primary")
             yield Button("Disable", id="disable", disabled=True)
+            yield Button("Download now", id="download-now", disabled=True)
+            if self.owner:
+                yield Button("Detach", id="detach")
             yield Button("Refresh", id="refresh")
             yield Button("Quit", id="quit")
 
@@ -137,10 +149,17 @@ class VdlApp(App[None]):
                 display_service(source.service),
                 source.account,
                 format_age(source.last_check),
-                "active" if source.active else "inactive",
+                self._source_state(source),
                 key=str(source.path),
             )
         self._update_mutation_buttons()
+
+    def _source_state(self, source: Source) -> str:
+        if self._source_is_running(source):
+            return "downloading"
+        if source.download_requested:
+            return "queued"
+        return "active" if source.active else "inactive"
 
     def _selected_source(self) -> Source | None:
         table = self.query_one("#sources", DataTable)
@@ -153,11 +172,23 @@ class VdlApp(App[None]):
         busy = self._worker_busy()
         self.query_one("#add", Button).disabled = busy
         self.query_one("#disable", Button).disabled = busy or source is None or not source.active
+        self.query_one("#download-now", Button).disabled = (
+            source is None
+            or not source.active
+            or source.download_requested
+            or self._source_is_running(source)
+        )
 
     def _worker_busy(self) -> bool:
         return bool(read_busy()) if not self.owner else bool(
             self.scheduler is not None and self.scheduler.busy
         )
+
+    def _source_is_running(self, source: Source) -> bool:
+        if self.owner:
+            current = self.scheduler.current_source if self.scheduler is not None else None
+            return current is not None and current.path == source.path
+        return read_busy() == f"{source.service}/{source.account}"
 
     def on_data_table_row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
         self._update_mutation_buttons()
@@ -167,7 +198,11 @@ class VdlApp(App[None]):
         self.query_one("#status", Static).update(
             f"Downloading {label}" if label else "Idle"
         )
-        self._update_mutation_buttons()
+        if label != self._last_busy_label:
+            self._last_busy_label = label
+            self.refresh_sources()
+        else:
+            self._update_mutation_buttons()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         match event.button.id:
@@ -180,6 +215,10 @@ class VdlApp(App[None]):
                         ConfirmDisableScreen(source),
                         lambda confirmed: self._disable_from_screen(source, confirmed),
                     )
+            case "download-now":
+                self._download_now_from_selection()
+            case "detach":
+                self._detach_from_tmux()
             case "refresh":
                 self.refresh_sources()
             case "quit":
@@ -200,6 +239,32 @@ class VdlApp(App[None]):
         message = "Source added" if result.created else "Source already exists"
         self.notify(f"{message}: {result.source.service}/{result.source.account}")
 
+    def _download_now_from_selection(self) -> None:
+        source = self._selected_source()
+        if source is None or not source.active:
+            return
+        if source.download_requested:
+            return
+        try:
+            result = request_download(self.repository, source)
+        except (OSError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+            self.refresh_sources()
+            return
+        self.refresh_sources()
+        self.notify(f"Download queued: {result.service}/{result.account}")
+        if self.owner and self.scheduler is not None:
+            self.scheduler.wake()
+
+    def _detach_from_tmux(self) -> None:
+        try:
+            subprocess.run(
+                ["tmux", "-L", "vdl", "detach-client", "-s", "main"],
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.notify(f"Could not detach: {exc}", severity="error")
+
     def _disable_from_screen(self, source: Source, confirmed: bool) -> None:
         if not confirmed:
             return
@@ -216,8 +281,7 @@ class VdlApp(App[None]):
         self.query_one("#status", Static).update(
             f"Downloading {display_service(source.service)} / {source.account}"
         )
-        self.query_one("#add", Button).disabled = True
-        self.query_one("#disable", Button).disabled = True
+        self.refresh_sources()
 
     async def _download_completed(self, _source: Source, _exit_code: int | None) -> None:
         self.query_one("#status", Static).update("Idle")

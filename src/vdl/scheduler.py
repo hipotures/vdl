@@ -34,15 +34,23 @@ def select_due_source(
 ) -> Source | None:
     """Select the next source without mutating the filesystem.
 
-    Sources with no marker are new and always win.  Existing markers must be
-    overdue and the newest marker across active sources must be at least
-    ``minimum_spacing`` old.  Among overdue sources the oldest marker wins.
+    Explicit download requests always win and bypass interval and spacing
+    checks. Sources with no marker are otherwise new and always win. Existing
+    markers must be overdue and the newest marker across active sources must
+    be at least ``minimum_spacing`` old. Among overdue sources the oldest
+    marker wins.
     """
 
     all_sources = list(sources)
     active = [source for source in all_sources if source.active]
     if not active:
         return None
+
+    requested = [
+        source for source in active if getattr(source, "download_requested", False)
+    ]
+    if requested:
+        return min(requested, key=_source_sort_key)
 
     new_sources = [source for source in active if source.last_check is None]
     if new_sources:
@@ -104,6 +112,7 @@ class Scheduler:
         self._worker_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._wake_event: asyncio.Event | None = None
         self._current_source: Source | None = None
         self.last_result: tuple[Source, int | None] | None = None
 
@@ -121,8 +130,15 @@ class Scheduler:
         if self._task is not None and not self._task.done():
             return self._task
         self._stop_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
         self._task = asyncio.create_task(self._run_loop(), name="vdl-scheduler")
         return self._task
+
+    def wake(self) -> None:
+        """Ask the existing scheduler loop to scan as soon as it can."""
+
+        if self._wake_event is not None:
+            self._wake_event.set()
 
     async def stop(self) -> None:
         """Stop polling and cancel an in-flight downloader if necessary."""
@@ -132,11 +148,14 @@ class Scheduler:
             return
         if self._stop_event is not None:
             self._stop_event.set()
+        if self._wake_event is not None:
+            self._wake_event.set()
         if task is not asyncio.current_task() and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._task = None
         self._stop_event = None
+        self._wake_event = None
 
     async def run_once(self) -> Source | None:
         """Rescan the repository and, when eligible, run one source."""
@@ -165,6 +184,9 @@ class Scheduler:
             exit_code: int | None = None
             cancelled = False
             try:
+                clear_request = getattr(self.repository, "clear_download_request", None)
+                if clear_request is not None:
+                    clear_request(source)
                 await self._notify_start(source)
                 exit_code = await self.runner.run(source)
                 self.last_result = (source, exit_code)
@@ -199,10 +221,14 @@ class Scheduler:
 
     async def _run_loop(self) -> None:
         stop_event = self._stop_event
-        if stop_event is None:
+        wake_event = self._wake_event
+        if stop_event is None or wake_event is None:
             return
         try:
             while not stop_event.is_set():
+                # Consume a wake request before scanning.  A request arriving
+                # during the scan remains set and wakes the following wait.
+                wake_event.clear()
                 try:
                     await self.run_once()
                 except asyncio.CancelledError:
@@ -211,12 +237,23 @@ class Scheduler:
                     # A transient repository failure must not silently kill
                     # the owner application.  The next poll retries.
                     self.logger.exception("scheduler scan error")
-                try:
-                    await asyncio.wait_for(
-                        stop_event.wait(), timeout=self.scheduler_poll
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                await self._wait_for_next_scan(stop_event, wake_event)
         except asyncio.CancelledError:
             self.logger.info("scheduler stopped")
             raise
+
+    async def _wait_for_next_scan(
+        self, stop_event: asyncio.Event, wake_event: asyncio.Event
+    ) -> None:
+        stop_task = asyncio.create_task(stop_event.wait())
+        wake_task = asyncio.create_task(wake_event.wait())
+        try:
+            await asyncio.wait(
+                (stop_task, wake_task),
+                timeout=self.scheduler_poll,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            stop_task.cancel()
+            wake_task.cancel()
+            await asyncio.gather(stop_task, wake_task, return_exceptions=True)

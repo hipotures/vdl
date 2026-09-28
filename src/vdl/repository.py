@@ -13,6 +13,7 @@ from .runtime import MUTATION_LOCK, file_lock
 SOURCE_FILE = ".source"
 DISABLED_SOURCE_FILE = ".source.del"
 LAST_CHECK_FILE = ".last-check"
+DOWNLOAD_NOW_FILE = ".download-now"
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +26,8 @@ class Source:
     url: str
     active: bool
     last_check: float | None
+    download_requested: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class AddResult:
@@ -76,6 +79,7 @@ class SourceRepository:
             last_check = (source_dir / LAST_CHECK_FILE).stat().st_mtime
         except OSError:
             last_check = None
+        download_requested = (source_dir / DOWNLOAD_NOW_FILE).is_file()
         return Source(
             service=service_dir.name,
             account=source_dir.name,
@@ -83,6 +87,7 @@ class SourceRepository:
             url=url,
             active=active,
             last_check=last_check,
+            download_requested=download_requested,
         )
 
     @staticmethod
@@ -145,6 +150,28 @@ class SourceRepository:
         if updated is None:
             raise OSError(f"source marker disappeared: {source.path}")
         return updated
+
+    def request_download(self, source: Source) -> Source:
+        """Queue one immediate download request for an active source."""
+
+        with file_lock(MUTATION_LOCK):
+            current = self._source_at(source.path)
+            if current is None:
+                raise FileNotFoundError(f"source marker disappeared: {source.path}")
+            if not current.active:
+                raise ValueError("source is inactive")
+            (current.path / DOWNLOAD_NOW_FILE).touch(exist_ok=True)
+            updated = self._source_at(current.path)
+        if updated is None:  # pragma: no cover - marker was just created
+            raise OSError(f"source marker disappeared: {source.path}")
+        return updated
+
+    def clear_download_request(self, source: Source) -> None:
+        """Consume an immediate download request before starting the attempt."""
+
+        with file_lock(MUTATION_LOCK):
+            (source.path / DOWNLOAD_NOW_FILE).unlink(missing_ok=True)
+
 
 def _sanitize_component(value: str, fallback: str = "source") -> str:
     value = unquote(value).strip()

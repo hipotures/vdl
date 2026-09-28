@@ -42,7 +42,13 @@ def _config(root: Path, **overrides: object):
     return config_from_mapping(values)
 
 
-def _fake_source(name: str, last_check: float | None, *, active: bool = True):
+def _fake_source(
+    name: str,
+    last_check: float | None,
+    *,
+    active: bool = True,
+    download_requested: bool = False,
+):
     return SimpleNamespace(
         service="site",
         account=name,
@@ -50,6 +56,7 @@ def _fake_source(name: str, last_check: float | None, *, active: bool = True):
         url=f"https://example.test/{name}",
         active=active,
         last_check=last_check,
+        download_requested=download_requested,
     )
 
 
@@ -175,6 +182,7 @@ def test_scheduler_due_selection_handles_new_oldest_and_spacing():
     new = _fake_source("new", None)
     inactive = _fake_source("inactive", 100.0, active=False)
     sources = [newest, inactive, middle, new, oldest]
+    requested = _fake_source("requested", 999.0, download_requested=True)
 
     assert source_is_due(new, now, 10_000.0)
     assert source_is_due(oldest, now, 200.0)
@@ -182,6 +190,12 @@ def test_scheduler_due_selection_handles_new_oldest_and_spacing():
     assert select_due_source(
         sources, now=now, check_interval=200.0, minimum_spacing=10_000.0
     ) is new
+    assert select_due_source(
+        [*sources, requested],
+        now=now,
+        check_interval=10_000.0,
+        minimum_spacing=10_000.0,
+    ) is requested
 
     without_new = [source for source in sources if source is not new]
     assert select_due_source(
@@ -300,6 +314,37 @@ async def test_scheduler_never_runs_two_downloads_at_once(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_download_now_bypasses_schedule_and_is_consumed(tmp_path: Path):
+    repository = SourceRepository(tmp_path / "downloads")
+    source = repository.add_source("https://example.test/download-now").source
+    marker = source.path / ".last-check"
+    marker.touch()
+    source = repository.list_sources()[0]
+    repository.request_download(source)
+    calls: list[object] = []
+
+    class RecordingRunner:
+        async def run(self, selected_source):
+            calls.append(selected_source)
+            return 0
+
+    config = SimpleNamespace(
+        check_interval=10_000,
+        minimum_spacing=10_000,
+        scheduler_poll=60,
+        log_file=tmp_path / "scheduler.log",
+    )
+    scheduler = Scheduler(repository, config, runner=RecordingRunner())
+
+    selected = await scheduler.run_once()
+
+    assert selected is not None
+    assert selected.path == source.path
+    assert len(calls) == 1
+    assert not (source.path / ".download-now").exists()
+
+
+@pytest.mark.asyncio
 async def test_runner_cancellation_stops_downloader_process_group(tmp_path: Path):
     source = SourceRepository(tmp_path / "downloads").add_source(
         "https://example.test/cancel"
@@ -349,11 +394,50 @@ async def test_client_textual_app_reads_sources_without_starting_scheduler(tmp_p
         assert app.scheduler is None
         assert not app.query_one("#add", Button).disabled
         assert not app.query_one("#disable", Button).disabled
+        assert not app.query_one("#download-now", Button).disabled
         set_busy("tiktok/ui-test")
         app._sync_runtime_busy()
         assert app.query_one("#add", Button).disabled
         assert app.query_one("#disable", Button).disabled
+        assert app.query_one("#download-now", Button).disabled
         set_busy(None)
+        app._sync_runtime_busy()
+        assert not app.query_one("#download-now", Button).disabled
+        await pilot.click("#download-now")
+        await pilot.pause()
+        request_marker = repository.list_sources()[0].path / ".download-now"
+        assert request_marker.exists()
+        assert app.query_one("#download-now", Button).disabled
+        assert table.get_row_at(0)[4] == "queued"
+        request_marker.unlink()
+        set_busy("tiktok/ui-test")
+        app._sync_runtime_busy()
+        assert app.query_one("#download-now", Button).disabled
+        assert table.get_row_at(0)[4] == "downloading"
+        set_busy(None)
+        app._sync_runtime_busy()
+        assert not app.query_one("#download-now", Button).disabled
+        assert table.get_row_at(0)[4] == "active"
+        await pilot.press("q")
+
+
+@pytest.mark.asyncio
+async def test_owner_textual_app_detaches_tmux_client(tmp_path: Path, monkeypatch):
+    calls: list[tuple[list[str], bool]] = []
+
+    def fake_run(command, *, check):
+        calls.append((command, check))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("vdl.ui.subprocess.run", fake_run)
+    app = VdlApp(_config(tmp_path), owner=True)
+
+    async with app.run_test() as pilot:
+        await pilot.click("#detach")
+        await pilot.pause()
+        assert calls == [
+            (["tmux", "-L", "vdl", "detach-client", "-s", "main"], True)
+        ]
         await pilot.press("q")
 
 

@@ -20,6 +20,12 @@ def add_source(repository: SourceRepository, url: str) -> AddResult:
     return repository.add_source(url)
 
 
+def request_download(repository: SourceRepository, source: Source) -> Source:
+    """Queue one immediate download for an active source."""
+
+    return repository.request_download(source)
+
+
 def parse_source_numbers(values: str | Iterable[str]) -> list[int]:
     """Parse source list positions separated by whitespace, commas, or semicolons."""
 
@@ -75,4 +81,3 @@ def format_age(last_check: float | None, now: float | None = None) -> str:
         return f"{hours}h {minutes:02d}m ago"
     days, hours = divmod(hours, 24)
     return f"{days}d {hours}h ago"
-
