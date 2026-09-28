@@ -103,7 +103,7 @@ class SourceRepository:
 
         if not isinstance(url, str) or not url.strip():
             raise ValueError("source URL must be a non-empty string")
-        url = url.strip()
+        url = url.strip().partition("?")[0]
         service, account = derive_source_location(url)
         candidate = self.download_root / service / account
         with file_lock(MUTATION_LOCK):

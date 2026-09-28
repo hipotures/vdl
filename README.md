@@ -55,6 +55,9 @@ $ vdl add https://www.youtube.com/@example
 $ vdl del 2,4 7
 ```
 
+When a source is added, the first `?` and everything after it are removed from
+the URL before it is stored.
+
 Use the **Detach** button to leave tmux while the scheduler continues running.
 `Ctrl-b d` does the same when the surrounding terminal passes tmux shortcuts.
 Choosing Quit ends the tmux session, and systemd starts a fresh owner after

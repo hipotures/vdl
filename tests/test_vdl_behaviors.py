@@ -84,7 +84,6 @@ def test_url_derivation_and_existing_directory_handling(tmp_path: Path):
 
     repository = SourceRepository(tmp_path)
     first = repository.add_source("https://www.tiktok.com/@foo")
-    second_url = "https://www.tiktok.com/@foo?variant=2"
     repeated = repository.add_source("https://www.tiktok.com/@foo")
 
     unrelated = tmp_path / "instagram" / "reserved"
@@ -95,8 +94,6 @@ def test_url_derivation_and_existing_directory_handling(tmp_path: Path):
     assert first.created
     assert not repeated.created
     assert repeated.source.account == "foo"
-    with pytest.raises(FileExistsError):
-        repository.add_source(second_url)
     assert adopted.source.path == unrelated
     assert (unrelated / "keep.txt").read_text(encoding="utf-8") == "untouched"
     assert (unrelated / ".source").read_text(encoding="utf-8") == (
@@ -132,7 +129,9 @@ def test_filesystem_discovery_distinguishes_active_inactive_and_ignored(tmp_path
 def test_add_creates_source_marker_without_a_check_marker(tmp_path: Path):
     repository = SourceRepository(tmp_path)
 
-    result = repository.add_source("https://www.instagram.com/example/")
+    result = repository.add_source(
+        "https://www.instagram.com/example/?utm_source=test&tab=posts"
+    )
 
     source = result.source
     assert result.created
@@ -142,6 +141,19 @@ def test_add_creates_source_marker_without_a_check_marker(tmp_path: Path):
     )
     assert not (source.path / ".source.del").exists()
     assert not (source.path / ".last-check").exists()
+
+
+def test_add_treats_urls_with_different_query_strings_as_the_same_source(
+    tmp_path: Path,
+):
+    repository = SourceRepository(tmp_path)
+
+    first = repository.add_source("https://example.test/account?one=1")
+    repeated = repository.add_source("https://example.test/account?two=2")
+
+    assert first.created
+    assert not repeated.created
+    assert repeated.source.url == "https://example.test/account"
 
 
 def test_disable_renames_only_the_source_marker(tmp_path: Path):
