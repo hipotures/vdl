@@ -115,6 +115,15 @@ async def test_mobile_first_add_live_updates_and_sticky_composer(tmp_path, width
                 assert len(repo.list_sources()) == 20
                 assert all("tracking=" not in item.url for item in repo.list_sources())
                 assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+                # A never-checked source is Pending, but Download now must still
+                # be available. Manual forcing bypasses normal scheduling even
+                # while another source is currently downloading.
+                pending_source = next(item for item in repo.list_sources() if item.service == "tiktok")
+                force = page.locator(f'[data-id="{pending_source.id}"] .download')
+                await expect(force).to_be_enabled()
+                await force.click()
+                await expect(page.locator("#message")).to_contain_text("Download requested")
+                assert (pending_source.path / ".download-now").exists()
                 # The next poll must not overwrite unfinished input or focus.
                 await page.locator("#source-url").fill("https://example.test/unfinished")
                 repo.add_source("https://example.test/from-cli")
