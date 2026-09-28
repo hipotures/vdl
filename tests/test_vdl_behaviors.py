@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +13,16 @@ from textual.widgets import Button, DataTable
 
 from vdl.config import config_from_mapping, parse_duration
 from vdl.domain import disable_sources, parse_source_numbers
-from vdl.install import _write_tmux_config, owner_unit_text, web_unit_text
+from vdl.install import (
+    _write_tmux_config,
+    deinstall_services,
+    install_services,
+    owner_unit_text,
+    web_unit_text,
+)
 from vdl.repository import SourceRepository, derive_source_location
 from vdl.runner import YtDlpRunner
+from vdl.runtime import OWNER_LOCK, file_lock, set_busy
 from vdl.scheduler import Scheduler, select_due_source, source_is_due
 from vdl.ui import VdlApp
 
@@ -53,6 +62,10 @@ def test_url_derivation_and_deterministic_collision_names(tmp_path: Path):
         "youtube",
         "foo",
     )
+    assert derive_source_location("https://www.youtube.com/@foo/videos") == (
+        "youtube",
+        "foo",
+    )
     assert derive_source_location("https://www.instagram.com/foo/") == (
         "instagram",
         "foo",
@@ -68,12 +81,33 @@ def test_url_derivation_and_deterministic_collision_names(tmp_path: Path):
     second = repository.add_source(second_url)
     repeated = repository.add_source(second_url)
 
+    unrelated = tmp_path / "instagram" / "reserved"
+    unrelated.mkdir(parents=True)
+    (unrelated / "keep.txt").write_text("untouched", encoding="utf-8")
+    beside_unrelated = repository.add_source("https://www.instagram.com/reserved/")
+
     assert first.created
     assert second.created
     assert second.source.account.startswith("foo-")
     assert second.source.account == repeated.source.account
     assert not repeated.created
     assert repeated.source.url == second_url
+    assert beside_unrelated.source.path != unrelated
+    assert (unrelated / "keep.txt").read_text(encoding="utf-8") == "untouched"
+    assert not (unrelated / ".source").exists()
+
+    concurrent_repository = SourceRepository(tmp_path / "concurrent")
+    urls = [
+        "https://www.tiktok.com/@racer?one",
+        "https://www.tiktok.com/@racer?two",
+    ]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(concurrent_repository.add_source, urls))
+    concurrent_sources = concurrent_repository.list_sources()
+    assert {source.url for source in concurrent_sources} == set(urls)
+    assert len({source.path for source in concurrent_sources}) == 2
 
 
 def test_filesystem_discovery_distinguishes_active_inactive_and_ignored(tmp_path: Path):
@@ -88,12 +122,16 @@ def test_filesystem_discovery_distinguishes_active_inactive_and_ignored(tmp_path
         "https://www.tiktok.com/@inactive\n", encoding="utf-8"
     )
     (ignored / "media.mp4").write_bytes(b"data")
+    malformed = tmp_path / "youtube" / "malformed"
+    malformed.mkdir(parents=True)
+    (malformed / ".source").write_bytes(b"https://example.test/\xff")
 
     sources = SourceRepository(tmp_path).list_sources()
 
     assert [(source.account, source.active, source.url) for source in sources] == [
         ("active", True, "https://www.tiktok.com/@active"),
         ("inactive", False, "https://www.tiktok.com/@inactive"),
+        ("malformed", True, "https://example.test/�"),
     ]
 
 
@@ -165,6 +203,13 @@ def test_scheduler_due_selection_handles_new_oldest_and_spacing():
     assert select_due_source(
         without_new, now=now, check_interval=200.0, minimum_spacing=100.0
     ) is oldest
+    recently_disabled = _fake_source("disabled-now", 950.0, active=False)
+    assert select_due_source(
+        [oldest, middle, recently_disabled],
+        now=now,
+        check_interval=200.0,
+        minimum_spacing=100.0,
+    ) is None
 
 
 def test_duration_parser_supports_documented_units():
@@ -189,6 +234,7 @@ async def test_runner_uses_configured_argv_cwd_and_touches_marker(tmp_path: Path
         "    'marker_at_start': pathlib.Path('.last-check').exists(),\n"
         "}), encoding='utf-8')\n"
         "print('fake stdout')\n"
+        "print('x' * 70000)\n"
         "print('fake stderr', file=sys.stderr)\n",
         encoding="utf-8",
     )
@@ -212,6 +258,7 @@ async def test_runner_uses_configured_argv_cwd_and_touches_marker(tmp_path: Path
     log = log_file.read_text(encoding="utf-8")
     assert "fake stdout" in log
     assert "fake stderr" in log
+    assert "x" * 70_000 in log
     assert "yt-dlp exit code=0" in log
 
 
@@ -245,7 +292,13 @@ async def test_scheduler_never_runs_two_downloads_at_once(tmp_path: Path):
         scheduler_poll=1,
         log_file=tmp_path / "scheduler.log",
     )
-    scheduler = Scheduler(Repository(), config, runner=BlockingRunner())
+    completion_busy_states: list[bool] = []
+    scheduler = Scheduler(
+        Repository(),
+        config,
+        runner=BlockingRunner(),
+        on_complete=lambda _source, _code: completion_busy_states.append(scheduler.busy),
+    )
     first = asyncio.create_task(scheduler.run_once())
     await started.wait()
     second = asyncio.create_task(scheduler.run_once())
@@ -256,6 +309,44 @@ async def test_scheduler_never_runs_two_downloads_at_once(tmp_path: Path):
     assert len(calls) == 1
     assert max_active == 1
     assert not scheduler.busy
+    assert completion_busy_states == [False]
+
+
+@pytest.mark.asyncio
+async def test_runner_cancellation_stops_downloader_process_group(tmp_path: Path):
+    source = SourceRepository(tmp_path / "downloads").add_source(
+        "https://example.test/cancel"
+    ).source
+    child_marker = tmp_path / "child-survived"
+    fake = tmp_path / "fake-tree"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        f"\"import time; from pathlib import Path; time.sleep(1); Path({str(child_marker)!r}).write_text('bad')\"])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    task = asyncio.create_task(YtDlpRunner([str(fake)], log_file=tmp_path / "log").run(source))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(1.1)
+    assert not child_marker.exists()
+
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        f"\"import time; from pathlib import Path; time.sleep(1); Path({str(child_marker)!r}).write_text('bad')\"], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n",
+        encoding="utf-8",
+    )
+    assert await YtDlpRunner([str(fake)], log_file=tmp_path / "log-2").run(source) == 0
+    await asyncio.sleep(1.1)
+    assert not child_marker.exists()
 
 
 @pytest.mark.asyncio
@@ -271,7 +362,24 @@ async def test_client_textual_app_reads_sources_without_starting_scheduler(tmp_p
         assert app.scheduler is None
         assert not app.query_one("#add", Button).disabled
         assert not app.query_one("#disable", Button).disabled
+        set_busy("tiktok/ui-test")
+        app._sync_runtime_busy()
+        assert app.query_one("#add", Button).disabled
+        assert app.query_one("#disable", Button).disabled
+        set_busy(None)
         await pilot.press("q")
+
+
+def test_owner_lock_is_process_wide():
+    code = (
+        "from vdl.runtime import OWNER_LOCK, file_lock; "
+        "\ntry:\n"
+        " with file_lock(OWNER_LOCK, blocking=False): pass\n"
+        "except BlockingIOError:\n raise SystemExit(3)\n"
+    )
+    with file_lock(OWNER_LOCK):
+        result = subprocess.run([sys.executable, "-c", code], check=False)
+    assert result.returncode == 3
 
 
 def test_generated_units_keep_vdl_tmux_and_restart_contract(tmp_path: Path):
@@ -293,3 +401,36 @@ def test_generated_units_keep_vdl_tmux_and_restart_contract(tmp_path: Path):
     assert "RestartSec=10" in owner_text
     assert "--serve-web" in web_text
     assert "Restart=always" in web_text
+
+
+def test_install_and_deinstall_preserve_configuration(tmp_path: Path):
+    calls: list[list[str]] = []
+
+    def fake_run(command, *, check):
+        calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    config = tmp_path / "config" / "config.toml"
+    units = tmp_path / "systemd"
+    tmux = tmp_path / "config" / "tmux.conf"
+    installed = install_services(
+        config_path=config,
+        unit_dir=units,
+        tmux_config=tmux,
+        executable=["/opt/vdl/bin/vdl"],
+        runner=fake_run,
+    )
+    original_config = config.read_bytes()
+
+    deinstall_services(unit_dir=units, runner=fake_run)
+
+    assert installed.owner_unit.exists() is False
+    assert installed.web_unit.exists() is False
+    assert config.read_bytes() == original_config
+    assert tmux.exists()
+    assert calls == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "vdl.service", "vdl-web.service"],
+        ["systemctl", "--user", "disable", "--now", "vdl.service", "vdl-web.service"],
+        ["systemctl", "--user", "daemon-reload"],
+    ]

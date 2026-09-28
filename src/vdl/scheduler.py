@@ -3,56 +3,35 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+from collections.abc import Awaitable, Callable, Iterable
 import logging
 import time
-from pathlib import Path
-from typing import Any, Callable, Iterable
 
+from .config import Config
+from .repository import Source, SourceRepository
 from .runner import YtDlpRunner, get_logger
+from .runtime import set_busy
 
 
-def _last_check(source: Any) -> float | None:
-    """Read a source's marker timestamp, tolerating lightweight source fakes."""
-
-    value = getattr(source, "last_check", None)
-    if value is not None:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            pass
-    path = getattr(source, "path", None)
-    if path is None:
-        return None
-    try:
-        return Path(path, ".last-check").stat().st_mtime
-    except (FileNotFoundError, NotADirectoryError, OSError):
-        return None
-
-
-def _source_sort_key(source: Any) -> tuple[str, str, str]:
+def _source_sort_key(source: Source) -> tuple[str, str, str]:
     """Provide deterministic tie-breaking after timestamp ordering."""
 
-    service = str(getattr(source, "service", "")).casefold()
-    account = str(getattr(source, "account", "")).casefold()
-    path = str(getattr(source, "path", "")).casefold()
-    return service, account, path
+    return source.service.casefold(), source.account.casefold(), str(source.path).casefold()
 
 
-def source_is_due(source: Any, now: float, check_interval: float) -> bool:
+def source_is_due(source: Source, now: float, check_interval: float) -> bool:
     """Return whether an active source should be considered for a check."""
 
-    marker_time = _last_check(source)
-    return marker_time is None or now - marker_time >= check_interval
+    return source.last_check is None or now - source.last_check >= check_interval
 
 
 def select_due_source(
-    sources: Iterable[Any],
+    sources: Iterable[Source],
     *,
     now: float,
     check_interval: float,
     minimum_spacing: float,
-) -> Any | None:
+) -> Source | None:
     """Select the next source without mutating the filesystem.
 
     Sources with no marker are new and always win.  Existing markers must be
@@ -61,38 +40,36 @@ def select_due_source(
     """
 
     all_sources = list(sources)
-    marker_times = {id(source): _last_check(source) for source in all_sources}
-    active = [source for source in all_sources if bool(getattr(source, "active", True))]
+    active = [source for source in all_sources if source.active]
     if not active:
         return None
 
-    new_sources = [source for source in active if marker_times[id(source)] is None]
+    new_sources = [source for source in active if source.last_check is None]
     if new_sources:
         return min(new_sources, key=_source_sort_key)
 
     overdue = [
         source
         for source in active
-        if now - marker_times[id(source)] >= check_interval
+        if source.last_check is not None and now - source.last_check >= check_interval
     ]
     if not overdue:
         return None
 
     latest_check = max(
-        marker_time for marker_time in marker_times.values() if marker_time is not None
+        source.last_check for source in all_sources if source.last_check is not None
     )
     if now - latest_check < minimum_spacing:
         return None
 
     return min(
         overdue,
-        key=lambda source: (marker_times[id(source)], _source_sort_key(source)),
+        key=lambda source: (source.last_check, _source_sort_key(source)),
     )
 
 
-# A concise alias reads naturally in tests and callers that use “next” rather
-# than “due” terminology.
-select_next_source = select_due_source
+StartCallback = Callable[[Source], Awaitable[None] | None]
+CompleteCallback = Callable[[Source, int | None], Awaitable[None] | None]
 
 
 class Scheduler:
@@ -100,14 +77,13 @@ class Scheduler:
 
     def __init__(
         self,
-        repository: Any,
-        config: Any,
-        runner: YtDlpRunner | Any | None = None,
+        repository: SourceRepository,
+        config: Config,
+        runner: YtDlpRunner | None = None,
         *,
-        on_complete: Callable[..., Any] | None = None,
-        on_change: Callable[..., Any] | None = None,
+        on_start: StartCallback | None = None,
+        on_complete: CompleteCallback | None = None,
         logger: logging.Logger | None = None,
-        clock: Callable[[], float] = time.time,
     ) -> None:
         self.repository = repository
         self.config = config
@@ -118,8 +94,8 @@ class Scheduler:
             getattr(config, "log_file", None) or None
         )
         self.runner = runner or YtDlpRunner(config, logger=self.logger)
-        self.on_complete = on_complete if on_complete is not None else on_change
-        self.clock = clock
+        self.on_start = on_start
+        self.on_complete = on_complete
 
         # This lock covers source selection and the complete subprocess run.
         # Consequently concurrent run_once() calls cannot launch two
@@ -128,20 +104,16 @@ class Scheduler:
         self._worker_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
-        self._current_source: Any | None = None
-        self.last_result: tuple[Any, int | None] | None = None
+        self._current_source: Source | None = None
+        self.last_result: tuple[Source, int | None] | None = None
 
     @property
     def busy(self) -> bool:
-        return self._worker_lock.locked()
+        return self._current_source is not None
 
     @property
-    def current_source(self) -> Any | None:
+    def current_source(self) -> Source | None:
         return self._current_source
-
-    @property
-    def task(self) -> asyncio.Task[None] | None:
-        return self._task
 
     def start(self) -> asyncio.Task[None]:
         """Start the recurring scheduler task, returning the task handle."""
@@ -166,7 +138,7 @@ class Scheduler:
         self._task = None
         self._stop_event = None
 
-    async def run_once(self) -> Any | None:
+    async def run_once(self) -> Source | None:
         """Rescan the repository and, when eligible, run one source."""
 
         if self._worker_lock.locked():
@@ -175,7 +147,7 @@ class Scheduler:
         async with self._worker_lock:
             self.logger.info("scheduler scan")
             sources = list(self.repository.list_sources())
-            now = self.clock()
+            now = time.time()
             source = select_due_source(
                 sources,
                 now=now,
@@ -186,59 +158,43 @@ class Scheduler:
                 return None
 
             self._current_source = source
+            set_busy(f"{source.service}/{source.account}")
             self.logger.info(
-                "source selected source=%s url=%s",
-                getattr(source, "path", ""),
-                getattr(source, "url", ""),
+                "source selected source=%s url=%s", source.path, source.url
             )
             exit_code: int | None = None
-            completed = False
             cancelled = False
             try:
+                await self._notify_start(source)
                 exit_code = await self.runner.run(source)
-                completed = True
                 self.last_result = (source, exit_code)
                 return source
             except asyncio.CancelledError:
                 cancelled = True
-                self.logger.info(
-                    "source cancelled source=%s", getattr(source, "path", "")
-                )
+                self.logger.info("source cancelled source=%s", source.path)
                 raise
             except Exception:
                 self.last_result = (source, None)
-                self.logger.exception(
-                    "source failed source=%s", getattr(source, "path", "")
-                )
+                self.logger.exception("source failed source=%s", source.path)
                 return source
             finally:
                 self._current_source = None
-                if not cancelled and (completed or exit_code is None):
+                set_busy(None)
+                if not cancelled:
                     await self._notify_complete(source, exit_code)
 
-    async def _notify_complete(self, source: Any, exit_code: int | None) -> None:
-        callback = self.on_complete
-        if callback is None:
+    async def _notify_start(self, source: Source) -> None:
+        if self.on_start is None:
             return
-        try:
-            signature = inspect.signature(callback)
-        except (TypeError, ValueError):
-            result = callback(source, exit_code)
-        else:
-            # Signature inspection happens before invocation so a TypeError
-            # raised by the callback itself is not mistaken for an arity
-            # mismatch.  Textual refresh callbacks commonly take no
-            # arguments, while integrations may want the source or exit code.
-            for arguments in ((source, exit_code), (source,), ()):
-                try:
-                    signature.bind(*arguments)
-                except TypeError:
-                    continue
-                result = callback(*arguments)
-                break
-            else:  # pragma: no cover - an invalid callback signature
-                raise TypeError("on_complete callback has unsupported arguments")
-        if inspect.isawaitable(result):
+        result = self.on_start(source)
+        if hasattr(result, "__await__"):
+            await result
+
+    async def _notify_complete(self, source: Source, exit_code: int | None) -> None:
+        if self.on_complete is None:
+            return
+        result = self.on_complete(source, exit_code)
+        if hasattr(result, "__await__"):
             await result
 
     async def _run_loop(self) -> None:
@@ -264,9 +220,3 @@ class Scheduler:
         except asyncio.CancelledError:
             self.logger.info("scheduler stopped")
             raise
-
-    async def run_forever(self) -> None:
-        """Run polling in the current task (useful for a service entrypoint)."""
-
-        task = self.start()
-        await task

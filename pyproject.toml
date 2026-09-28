@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vdl"
+version = "0.1.0"
+description = "A small Textual application for recurring yt-dlp downloads"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "CC0-1.0"
+dependencies = [
+    "textual>=8.2,<9",
+    "textual-serve>=1.1,<2",
+]
+
+[project.scripts]
+vdl = "vdl.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4,<10",
+    "pytest-asyncio>=1.2,<2",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vdl"]

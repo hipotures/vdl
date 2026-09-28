@@ -8,10 +8,11 @@ from pathlib import Path
 import re
 from urllib.parse import unquote, urlsplit
 
+from .runtime import MUTATION_LOCK, file_lock
+
 
 SOURCE_FILE = ".source"
 DISABLED_SOURCE_FILE = ".source.del"
-ARCHIVE_FILE = ".archive"
 LAST_CHECK_FILE = ".last-check"
 
 
@@ -25,15 +26,6 @@ class Source:
     url: str
     active: bool
     last_check: float | None
-
-    @property
-    def source_file(self) -> Path:
-        return self.path / (SOURCE_FILE if self.active else DISABLED_SOURCE_FILE)
-
-    @property
-    def last_check_path(self) -> Path:
-        return self.path / LAST_CHECK_FILE
-
 
 @dataclass(frozen=True, slots=True)
 class AddResult:
@@ -78,7 +70,7 @@ class SourceRepository:
         else:
             return None
         try:
-            url = marker.read_text(encoding="utf-8").strip()
+            url = marker.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             url = ""
         try:
@@ -109,96 +101,48 @@ class SourceRepository:
             raise ValueError("source URL must be a non-empty string")
         url = url.strip()
         service, account = derive_source_location(url)
-        candidate = self.download_root / service / account
-        existing = self._source_at(candidate)
-        if existing is not None and existing.url == url:
-            return AddResult(existing, created=False)
-        if existing is not None or (candidate.exists() and not candidate.is_dir()):
-            candidate = self._collision_path(service, account, url)
-            existing = self._source_at(candidate)
-            if existing is not None and existing.url == url:
-                return AddResult(existing, created=False)
-        candidate.mkdir(parents=True, exist_ok=True)
-        marker = candidate / SOURCE_FILE
-        if marker.exists():
-            # A source may have appeared between discovery and creation. Resolve
-            # it deterministically rather than overwriting a user's marker.
-            return self.add_source_at_collision(url, service, account)
-        marker.write_text(f"{url}\n", encoding="utf-8")
-        source = self._read_source(candidate.parent, candidate)
-        if source is None:  # pragma: no cover - the marker was just written
-            raise OSError(f"could not read newly created source {marker}")
-        return AddResult(source, created=True)
-
-    def add_source_at_collision(self, url: str, service: str, account: str) -> AddResult:
-        """Retry an add after a marker appeared at the initial candidate path."""
-
-        candidate = self._collision_path(service, account, url)
-        existing = self._source_at(candidate)
-        if existing is not None and existing.url == url:
-            return AddResult(existing, created=False)
-        candidate.mkdir(parents=True, exist_ok=True)
-        marker = candidate / SOURCE_FILE
-        if marker.exists():
-            return self.add_source_at_collision(url, service, account)
-        marker.write_text(f"{url}\n", encoding="utf-8")
-        source = self._read_source(candidate.parent, candidate)
-        if source is None:  # pragma: no cover
-            raise OSError(f"could not read newly created source {marker}")
-        return AddResult(source, created=True)
+        digest = sha256(url.encode("utf-8")).hexdigest()
+        names = [account, *(f"{account}-{digest[:length]}" for length in (8, 12, 16, 32))]
+        with file_lock(MUTATION_LOCK):
+            for name in names:
+                candidate = self.download_root / service / name
+                existing = self._source_at(candidate)
+                if existing is not None and existing.url == url:
+                    return AddResult(existing, created=False)
+                if candidate.exists():
+                    continue
+                candidate.mkdir(parents=True)
+                marker = candidate / SOURCE_FILE
+                try:
+                    with marker.open("x", encoding="utf-8") as handle:
+                        handle.write(f"{url}\n")
+                except FileExistsError:
+                    continue
+                source = self._read_source(candidate.parent, candidate)
+                if source is None:  # pragma: no cover - marker was just written
+                    raise OSError(f"could not read newly created source {marker}")
+                return AddResult(source, created=True)
+        raise OSError(f"could not allocate a source directory for {url}")
 
     def _source_at(self, path: Path) -> Source | None:
         if not path.is_dir():
             return None
         return self._read_source(path.parent, path)
 
-    def _collision_path(self, service: str, account: str, url: str) -> Path:
-        digest = sha256(url.encode("utf-8")).hexdigest()
-        for length in (8, 12, 16, 32):
-            candidate = self.download_root / service / f"{account}-{digest[:length]}"
-            existing = self._source_at(candidate)
-            if (existing is None and (not candidate.exists() or candidate.is_dir())) or (
-                existing is not None and existing.url == url
-            ):
-                return candidate
-        # SHA-256 collisions are outside practical concern; the final suffix
-        # keeps this operation finite if a test deliberately constructs one.
-        counter = 2
-        while True:
-            candidate = self.download_root / service / f"{account}-{digest}-{counter}"
-            existing = self._source_at(candidate)
-            if (existing is None and (not candidate.exists() or candidate.is_dir())) or (
-                existing is not None and existing.url == url
-            ):
-                return candidate
-            counter += 1
-
     def disable(self, source: Source) -> Source:
         """Rename an active marker to ``.source.del`` without touching data."""
 
         if not source.active:
             return source
-        active_marker = source.path / SOURCE_FILE
-        inactive_marker = source.path / DISABLED_SOURCE_FILE
-        if active_marker.exists():
-            active_marker.rename(inactive_marker)
-        updated = self._source_at(source.path)
+        with file_lock(MUTATION_LOCK):
+            active_marker = source.path / SOURCE_FILE
+            inactive_marker = source.path / DISABLED_SOURCE_FILE
+            if active_marker.exists():
+                active_marker.rename(inactive_marker)
+            updated = self._source_at(source.path)
         if updated is None:
             raise OSError(f"source marker disappeared: {source.path}")
         return updated
-
-    def touch_last_check(self, source: Source, when: float | None = None) -> float:
-        """Touch a source marker and return the resulting mtime."""
-
-        marker = source.path / LAST_CHECK_FILE
-        marker.touch(exist_ok=True)
-        if when is not None:
-            marker.touch(exist_ok=True)
-            import os
-
-            os.utime(marker, (when, when))
-        return marker.stat().st_mtime
-
 
 def _sanitize_component(value: str, fallback: str = "source") -> str:
     value = unquote(value).strip()
@@ -232,24 +176,18 @@ def derive_source_location(url: str) -> tuple[str, str]:
         raise ValueError("source URL must include a hostname")
     service = _hostname_service(hostname)
     segments = [segment for segment in parsed.path.split("/") if segment]
+    if len(segments) > 1 and segments[-1].casefold() in {"posts", "reels", "shorts", "videos"}:
+        segments.pop()
     component = segments[-1] if segments else hostname
     component = component.removeprefix("@")
     account = _sanitize_component(component)
     return service, account
 
 
-def source_age_seconds(source: Source, now: float | None = None) -> float | None:
-    """Return elapsed seconds since a source's last check, if it has one."""
-
-    if source.last_check is None:
-        return None
-    import time
-
-    current = time.time() if now is None else now
-    return max(0.0, current - source.last_check)
-
-
 def display_service(service: str) -> str:
     """Human-readable service label for CLI/UI tables."""
 
+    known = {"tiktok": "TikTok", "youtube": "YouTube"}
+    if service.casefold() in known:
+        return known[service.casefold()]
     return service.replace("-", " ").replace("_", " ").title()

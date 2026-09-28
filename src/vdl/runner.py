@@ -9,11 +9,15 @@ in :mod:`vdl.scheduler`.
 from __future__ import annotations
 
 import asyncio
+import codecs
+from collections.abc import Sequence
 import logging
-import time
-from dataclasses import dataclass
+import os
+import signal
 from pathlib import Path
-from typing import Any, Sequence
+
+from .config import Config
+from .repository import Source
 
 
 DEFAULT_LOG_FILE = Path("/tmp/vdl/vdl.log")
@@ -46,34 +50,22 @@ def get_logger(log_file: Path | str | None = DEFAULT_LOG_FILE) -> logging.Logger
     return logger
 
 
-@dataclass(frozen=True, slots=True)
-class RunResult:
-    """The result of one attempted downloader invocation."""
-
-    source: Any
-    exit_code: int | None
-    started_at: float
-
-
 class YtDlpRunner:
     """Launch one configured yt-dlp process.
 
-    ``config_or_command`` may be a configuration object exposing
-    ``yt_dlp_command`` and optionally ``log_file``, or it may be the command
-    sequence itself.  Keeping this small accommodation here lets the runner
-    remain independent of the configuration module's concrete class.
+    Tests may pass an explicit command sequence in place of a full config.
     """
 
     def __init__(
         self,
-        config_or_command: Any,
+        config_or_command: Config | Sequence[str],
         log_file: Path | str | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
-        if hasattr(config_or_command, "yt_dlp_command"):
-            command = getattr(config_or_command, "yt_dlp_command")
+        if isinstance(config_or_command, Config):
+            command = config_or_command.yt_dlp_command
             if log_file is None:
-                log_file = getattr(config_or_command, "log_file", DEFAULT_LOG_FILE)
+                log_file = config_or_command.log_file
         else:
             command = config_or_command
         if isinstance(command, (str, bytes)):
@@ -83,12 +75,8 @@ class YtDlpRunner:
             raise ValueError("yt_dlp_command must not be empty")
         self.logger = logger or get_logger(log_file or DEFAULT_LOG_FILE)
 
-    async def run(self, source: Any) -> int:
+    async def run(self, source: Source) -> int:
         """Run yt-dlp for ``source`` and return its process exit code.
-
-        The source object is intentionally duck-typed.  The repository's
-        source record supplies ``path`` and ``url``; accepting an object with
-        those two attributes keeps this boundary easy to test.
 
         A missing executable, invalid working directory, or another launch
         failure is logged and re-raised.  The scheduler catches that failure
@@ -100,8 +88,6 @@ class YtDlpRunner:
         source_url = str(source.url)
         marker = source_path / ".last-check"
         argv = (*self.command, source_url)
-        started_at = time.time()
-
         try:
             # Keep this immediately adjacent to process creation.  In
             # particular, do not create the marker when a source is added.
@@ -112,6 +98,7 @@ class YtDlpRunner:
                 cwd=str(source_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
             )
         except asyncio.CancelledError:
             self.logger.info("yt-dlp launch cancelled source=%s", source_path)
@@ -121,15 +108,22 @@ class YtDlpRunner:
             raise
 
         try:
-            output, _ = await process.communicate()
-            if output:
-                text = output.decode("utf-8", errors="replace")
-                # Preserve every byte as readable text in the log.  Logging
-                # line by line keeps the usual yt-dlp output easy to scan,
-                # while the final line is retained even without a newline.
-                for line in text.splitlines() or [text]:
-                    self.logger.info("yt-dlp output source=%s %s", source_path, line)
+            assert process.stdout is not None
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            pending = ""
+            while output := await process.stdout.read(64 * 1024):
+                pending += decoder.decode(output)
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    self.logger.info("yt-dlp output source=%s %s", source_path, line.rstrip("\r"))
+                if len(pending) > 1024 * 1024:
+                    self.logger.info("yt-dlp output source=%s %s", source_path, pending)
+                    pending = ""
+            pending += decoder.decode(b"", final=True)
+            if pending:
+                self.logger.info("yt-dlp output source=%s %s", source_path, pending)
             exit_code = await process.wait()
+            await self._stop_process(process)
             self.logger.info(
                 "yt-dlp exit code=%s source=%s", exit_code, source_path
             )
@@ -137,35 +131,28 @@ class YtDlpRunner:
             return exit_code
         except asyncio.CancelledError:
             self.logger.info("yt-dlp cancelled source=%s", source_path)
-            # Cancellation normally happens while communicate() is waiting.
-            # Terminate the child so stopping the owner cannot leave a
-            # downloader behind.  ``returncode`` is available on asyncio's
-            # Process and avoids sending a second signal after natural exit.
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+            await self._stop_process(process)
             raise
         except Exception:
             self.logger.exception("yt-dlp error source=%s", source_path)
+            await self._stop_process(process)
             raise
 
-    async def run_source(self, source: Any) -> int:
-        """Compatibility spelling for callers that prefer a verb-noun name."""
-
-        return await self.run(source)
-
-
-async def run_yt_dlp(
-    source: Any,
-    command: Sequence[str],
-    *,
-    log_file: Path | str = DEFAULT_LOG_FILE,
-    logger: logging.Logger | None = None,
-) -> int:
-    """Run ``command`` for one source using :class:`YtDlpRunner`."""
-
-    return await YtDlpRunner(command, log_file=log_file, logger=logger).run(source)
+    @staticmethod
+    async def _stop_process(process: asyncio.subprocess.Process) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            if process.returncode is None:
+                await process.wait()
+            return
+        for _ in range(50):
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+        if process.returncode is None:
+            await process.wait()
