@@ -166,7 +166,6 @@ async function tick() {
   clearTimeout(timer);
   if (!document.hidden) timer = setTimeout(tick, 1000);
 }
-$("#refresh").addEventListener("click", tick);
 document.addEventListener("visibilitychange", () => { clearTimeout(timer); if (!document.hidden) tick(); });
 window.addEventListener("online", tick);
 window.addEventListener("pageshow", tick);
