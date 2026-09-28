@@ -53,7 +53,7 @@ def _fake_source(name: str, last_check: float | None, *, active: bool = True):
     )
 
 
-def test_url_derivation_and_deterministic_collision_names(tmp_path: Path):
+def test_url_derivation_and_existing_directory_handling(tmp_path: Path):
     assert derive_source_location("https://www.tiktok.com/@foo?tab=videos#top") == (
         "tiktok",
         "foo",
@@ -78,36 +78,23 @@ def test_url_derivation_and_deterministic_collision_names(tmp_path: Path):
     repository = SourceRepository(tmp_path)
     first = repository.add_source("https://www.tiktok.com/@foo")
     second_url = "https://www.tiktok.com/@foo?variant=2"
-    second = repository.add_source(second_url)
-    repeated = repository.add_source(second_url)
+    repeated = repository.add_source("https://www.tiktok.com/@foo")
 
     unrelated = tmp_path / "instagram" / "reserved"
     unrelated.mkdir(parents=True)
     (unrelated / "keep.txt").write_text("untouched", encoding="utf-8")
-    beside_unrelated = repository.add_source("https://www.instagram.com/reserved/")
+    adopted = repository.add_source("https://www.instagram.com/reserved/")
 
     assert first.created
-    assert second.created
-    assert second.source.account.startswith("foo-")
-    assert second.source.account == repeated.source.account
     assert not repeated.created
-    assert repeated.source.url == second_url
-    assert beside_unrelated.source.path != unrelated
+    assert repeated.source.account == "foo"
+    with pytest.raises(FileExistsError):
+        repository.add_source(second_url)
+    assert adopted.source.path == unrelated
     assert (unrelated / "keep.txt").read_text(encoding="utf-8") == "untouched"
-    assert not (unrelated / ".source").exists()
-
-    concurrent_repository = SourceRepository(tmp_path / "concurrent")
-    urls = [
-        "https://www.tiktok.com/@racer?one",
-        "https://www.tiktok.com/@racer?two",
-    ]
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        list(executor.map(concurrent_repository.add_source, urls))
-    concurrent_sources = concurrent_repository.list_sources()
-    assert {source.url for source in concurrent_sources} == set(urls)
-    assert len({source.path for source in concurrent_sources}) == 2
+    assert (unrelated / ".source").read_text(encoding="utf-8") == (
+        "https://www.instagram.com/reserved/\n"
+    )
 
 
 def test_filesystem_discovery_distinguishes_active_inactive_and_ignored(tmp_path: Path):

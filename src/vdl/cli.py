@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     with file_lock(OWNER_LOCK, blocking=False):
                         set_busy(None)
-                        VdlApp(config, owner=True).run()
+                        VdlApp(config, owner=True).run(mouse=False)
                 except BlockingIOError as exc:
                     raise RuntimeError("another vdl owner is already running") from exc
             case "list":

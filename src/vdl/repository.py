@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 import re
 from urllib.parse import unquote, urlsplit
@@ -101,28 +100,31 @@ class SourceRepository:
             raise ValueError("source URL must be a non-empty string")
         url = url.strip()
         service, account = derive_source_location(url)
-        digest = sha256(url.encode("utf-8")).hexdigest()
-        names = [account, *(f"{account}-{digest[:length]}" for length in (8, 12, 16, 32))]
+        candidate = self.download_root / service / account
         with file_lock(MUTATION_LOCK):
-            for name in names:
-                candidate = self.download_root / service / name
+            existing = self._source_at(candidate)
+            if existing is not None:
+                if existing.url == url:
+                    return AddResult(existing, created=False)
+                raise FileExistsError(
+                    f"{candidate} already contains a different source URL"
+                )
+            if candidate.exists() and not candidate.is_dir():
+                raise FileExistsError(f"{candidate} exists and is not a directory")
+            candidate.mkdir(parents=True, exist_ok=True)
+            marker = candidate / SOURCE_FILE
+            try:
+                with marker.open("x", encoding="utf-8") as handle:
+                    handle.write(f"{url}\n")
+            except FileExistsError:
                 existing = self._source_at(candidate)
                 if existing is not None and existing.url == url:
                     return AddResult(existing, created=False)
-                if candidate.exists():
-                    continue
-                candidate.mkdir(parents=True)
-                marker = candidate / SOURCE_FILE
-                try:
-                    with marker.open("x", encoding="utf-8") as handle:
-                        handle.write(f"{url}\n")
-                except FileExistsError:
-                    continue
-                source = self._read_source(candidate.parent, candidate)
-                if source is None:  # pragma: no cover - marker was just written
-                    raise OSError(f"could not read newly created source {marker}")
-                return AddResult(source, created=True)
-        raise OSError(f"could not allocate a source directory for {url}")
+                raise
+            source = self._read_source(candidate.parent, candidate)
+            if source is None:  # pragma: no cover - marker was just written
+                raise OSError(f"could not read newly created source {marker}")
+            return AddResult(source, created=True)
 
     def _source_at(self, path: Path) -> Source | None:
         if not path.is_dir():
