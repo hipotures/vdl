@@ -1,38 +1,34 @@
 # vdl
 
-A small Linux application for recurring `yt-dlp` downloads, with a mouse-enabled
-Rich terminal interface and a separate mobile-first web interface. Source
-folders and marker files remain the persistent state: no database, broker,
+A small Linux application written in Rust for recurring `yt-dlp` downloads, with
+a mouse-enabled terminal interface (`ratatui` + `crossterm`) and a separate
+mobile-first web interface (`axum`, with static assets embedded in the binary).
+Source folders and marker files remain the persistent state: no database, broker,
 external queue, frontend framework, or JavaScript build step is required.
 
 ## Install
 
-Requires Python 3.12+, `uv`, `tmux`, `yt-dlp`, and a systemd user session.
+Requires Rust (`cargo`), `tmux`, `yt-dlp`, and a systemd user session.
 
 ```console
-uv tool install .
+cargo install --path .
 vdl install
 ```
 
 Installation creates configuration if absent and starts `vdl.service` (the
-headless single scheduler) and `vdl-web.service` (HTTP only). The Rich TUI is
+headless single scheduler) and `vdl-web.service` (HTTP only). The TUI is
 a client: `vdl attach` creates or attaches its tmux session only from an
 interactive terminal. Neither service requires root.
 
 For an existing installation, let the current download finish before restarting:
 
 ```console
-git fetch origin
-git switch work/rich-mobile-web
-uv tool install --force .
+cargo install --path . --force
 vdl install
 systemctl --user restart vdl vdl-web
 ```
 
 Existing configuration, downloaded media, archives, and markers are preserved.
-The previous Textual-based lockfile is removed in this branch rather than left
-inconsistent with the new dependencies. Run `uv lock` with registry access to
-create a new development lockfile; `uv tool install .` does not require one.
 
 ## Configuration
 
@@ -174,7 +170,7 @@ also enables the browser clipboard button where permission is granted.
 ```console
 tail -f /tmp/vdl/vdl.log
 systemctl --user status vdl vdl-web
-uv run --group dev pytest
+cargo test
 node --test tests/test_web.mjs
 ```
 

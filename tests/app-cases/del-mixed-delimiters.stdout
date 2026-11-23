@@ -1,0 +1,5 @@
+Sources to disable:
+#  Service  Account  Last check  State
+1  TikTok   alice    never       active
+2  YouTube  bob      never       active
+Disable these sources? [y/N] Disabled 2 source(s).

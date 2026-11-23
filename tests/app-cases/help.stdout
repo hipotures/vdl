@@ -1,0 +1,15 @@
+usage: vdl [-h] [--no-mouse] {attach,list,add,del,install,deinstall} ...
+
+positional arguments:
+  {attach,list,add,del,install,deinstall}
+    attach              open or attach to the persistent Rich TUI
+    list                list sources
+    add                 add a source
+    del                 disable sources
+    install             install user services and configuration
+    deinstall           remove vdl user services
+
+options:
+  -h, --help            show this help message and exit
+  --no-mouse            start the terminal without mouse capture (F2 toggles
+                        it)

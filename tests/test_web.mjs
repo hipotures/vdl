@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeURL, age } from "../src/vdl/static/url.js";
-import { sortSources } from "../src/vdl/static/sort.js";
+import { normalizeURL, age } from "../static/url.js";
+import { sortSources } from "../static/sort.js";
 
 test("query stripping keeps the exact profile URL", () => {
   assert.equal(normalizeURL("  https://www.youtube.com/@test?si=a&b=2  "), "https://www.youtube.com/@test");

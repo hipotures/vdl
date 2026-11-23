@@ -1,0 +1,7 @@
+bin.name = "vdl"
+args = ["del", "1,2;1"]
+env.add.HOME = "home"
+env.add.XDG_RUNTIME_DIR = "runtime"
+status.code = 0
+fs.sandbox = true
+fs.base = "del-mixed-delimiters.in"
