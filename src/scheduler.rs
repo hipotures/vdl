@@ -1,4 +1,4 @@
-//! One downloader, with pending work inferred from filesystem markers.
+//! One in-process downloader scheduler owned by `vdl serve`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,6 @@ use crate::config::Config;
 use crate::domain::now_unix;
 use crate::repository::{Source, SourceRepository};
 use crate::runner::{AppLogger, YtDlpRunner};
-use crate::runtime::{FileLock, set_busy};
 
 pub fn source_is_due(source: &Source, now: f64, check_interval: f64) -> bool {
     match source.last_check {
@@ -95,8 +94,11 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(repository: SourceRepository, config: &Config) -> std::io::Result<Self> {
-        let logger = Arc::new(AppLogger::new(Some(&config.log_file)));
+    pub fn new(
+        repository: SourceRepository,
+        config: &Config,
+        logger: Arc<AppLogger>,
+    ) -> std::io::Result<Self> {
         let runner = Arc::new(YtDlpRunner::new(config, Arc::clone(&logger))?);
         let poll_secs = config.scheduler_poll.clamp(0.01, 1.0);
         Ok(Self {
@@ -111,6 +113,10 @@ impl Scheduler {
         })
     }
 
+    pub fn wake_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.wake)
+    }
+
     pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
         tokio::spawn(async move {
             self.run_loop().await;
@@ -121,11 +127,7 @@ impl Scheduler {
         let Ok(_worker) = self.worker_lock.try_lock() else {
             return None;
         };
-        let Ok(download_lock) = FileLock::acquire(&self.repository.runtime.download_lock, false)
-        else {
-            return None;
-        };
-        let _ = set_busy(&self.repository.runtime, None);
+        self.repository.set_busy(None);
 
         let repo = self.repository.clone();
         let check_interval = self.check_interval;
@@ -138,12 +140,8 @@ impl Scheduler {
         .await;
 
         let source = match claimed {
-            Ok(Ok(Some(source))) => source,
-            Ok(Ok(None)) => return None,
-            Ok(Err(err)) => {
-                self.logger.error(&format!("scheduler claim error: {err}"));
-                return None;
-            }
+            Ok(Some(source)) => source,
+            Ok(None) => return None,
             Err(err) => {
                 self.logger.error(&format!("scheduler join error: {err}"));
                 return None;
@@ -155,15 +153,13 @@ impl Scheduler {
             source.path.display(),
             source.url
         ));
-        let fd = download_lock.as_raw_fd();
-        if let Err(err) = self.runner.run(&source, Some(fd)).await {
+        if let Err(err) = self.runner.run(&source).await {
             self.logger.error(&format!(
                 "source failed source={}: {err}",
                 source.path.display()
             ));
         }
-        let _ = set_busy(&self.repository.runtime, None);
-        drop(download_lock);
+        self.repository.set_busy(None);
         Some(source)
     }
 

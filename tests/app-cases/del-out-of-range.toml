@@ -1,7 +1,0 @@
-bin.name = "vdl"
-args = ["del", "5"]
-env.add.HOME = "home"
-env.add.XDG_RUNTIME_DIR = "runtime"
-status.code = 2
-fs.sandbox = true
-fs.base = "del-out-of-range.in"

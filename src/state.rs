@@ -1,12 +1,11 @@
-//! Shared snapshots and stable-ID operations for the terminal and HTTP API.
+//! Shared snapshots and stable-ID operations for the HTTP API and clients.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::now_unix;
 use crate::repository::{RepoError, SourceRepository, display_service};
-use crate::runtime::{FileLock, current_download, lock_is_held};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceSnapshot {
     pub id: String,
     pub service: String,
@@ -18,7 +17,7 @@ pub struct SourceSnapshot {
     pub last_check: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub sources: Vec<SourceSnapshot>,
     pub download: Option<String>,
@@ -27,54 +26,46 @@ pub struct AppSnapshot {
     pub time: f64,
 }
 
-pub fn snapshot(repository: &SourceRepository) -> Result<AppSnapshot, RepoError> {
-    let (rows, busy, timestamp) = {
-        let _lock = FileLock::acquire(&repository.runtime.mutation_lock, true)?;
-        let busy = current_download(&repository.runtime);
-        let sources = repository.list_sources();
-        let timestamp = now_unix();
-        let mut rows = Vec::with_capacity(sources.len());
-        for source in sources {
-            let id = source.id();
-            let running = busy.as_deref() == Some(id.as_str());
-            let pending =
-                source.active && (source.download_requested || source.last_check.is_none());
-            let state = if running {
-                if source.active {
-                    "downloading"
-                } else {
-                    "finishing"
-                }
-            } else if pending {
-                "queued"
-            } else if source.active {
-                "active"
+pub fn snapshot(repository: &SourceRepository) -> AppSnapshot {
+    let (sources, busy) = repository.snapshot_sources();
+    let timestamp = now_unix();
+    let mut rows = Vec::with_capacity(sources.len());
+    for source in sources {
+        let id = source.id();
+        let running = busy.as_deref() == Some(id.as_str());
+        let pending = source.active && (source.download_requested || source.last_check.is_none());
+        let state = if running {
+            if source.active {
+                "downloading"
             } else {
-                "inactive"
-            };
-            rows.push(SourceSnapshot {
-                id,
-                service: display_service(&source.service),
-                account: source.account,
-                url: source.url,
-                active: source.active,
-                state: state.to_string(),
-                download_requested: source.download_requested,
-                last_check: source.last_check,
-            });
-        }
-        (rows, busy, timestamp)
-    };
-
+                "finishing"
+            }
+        } else if pending {
+            "queued"
+        } else if source.active {
+            "active"
+        } else {
+            "inactive"
+        };
+        rows.push(SourceSnapshot {
+            id,
+            service: display_service(&source.service),
+            account: source.account,
+            url: source.url,
+            active: source.active,
+            state: state.to_string(),
+            download_requested: source.download_requested,
+            last_check: source.last_check,
+        });
+    }
     let pending = rows.iter().filter(|r| r.state == "queued").count();
-    let owner_running = lock_is_held(&repository.runtime.owner_lock);
-    Ok(AppSnapshot {
+    AppSnapshot {
         sources: rows,
         download: busy,
-        owner_running,
+        owner_running: true,
         pending,
         time: timestamp,
-    })
+    }
 }
 
 pub fn apply_action(

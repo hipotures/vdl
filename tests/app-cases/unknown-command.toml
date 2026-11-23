@@ -1,6 +1,0 @@
-bin.name = "vdl"
-args = ["bogus"]
-env.add.HOME = "home"
-env.add.XDG_RUNTIME_DIR = "runtime"
-status.code = 2
-fs.sandbox = true

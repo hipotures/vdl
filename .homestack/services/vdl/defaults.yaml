@@ -1,0 +1,12 @@
+schema: 3
+service: vdl
+resources:
+  cores: 2
+  memory: 1G
+  swap: 0M
+  rootfs: 2G
+deployment:
+  hostname: vdl
+  instances: 1
+  placement: single
+  state_model: local

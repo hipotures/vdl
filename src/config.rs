@@ -48,6 +48,7 @@ pub struct Config {
     pub log_file: PathBuf,
     pub web_host: String,
     pub web_port: u16,
+    pub server_url: Option<String>,
     pub yt_dlp_command: Vec<String>,
 }
 
@@ -61,6 +62,7 @@ impl Default for Config {
             log_file: PathBuf::from(DEFAULT_LOG_FILE),
             web_host: DEFAULT_WEB_HOST.to_string(),
             web_port: DEFAULT_WEB_PORT,
+            server_url: None,
             yt_dlp_command: vec![
                 "yt-dlp".to_string(),
                 "--download-archive".to_string(),
@@ -70,7 +72,35 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Resolve the HTTP base URL clients should connect to.
+    pub fn resolved_server_url(&self, cli_override: Option<&str>) -> String {
+        let raw = cli_override
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var("VDL_SERVER")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| self.server_url.clone())
+            .unwrap_or_else(|| {
+                let host = if self.web_host == "0.0.0.0" || self.web_host == "::" {
+                    "127.0.0.1"
+                } else {
+                    self.web_host.as_str()
+                };
+                format!("http://{host}:{}", self.web_port)
+            });
+        raw.trim().trim_end_matches('/').to_string()
+    }
+}
+
 pub fn default_config_path() -> PathBuf {
+    if let Ok(env_path) = std::env::var("VDL_CONFIG")
+        && !env_path.trim().is_empty()
+    {
+        return expand_tilde(env_path.trim());
+    }
     expand_tilde("~/.config/vdl/config.toml")
 }
 
@@ -210,6 +240,17 @@ pub fn config_from_table(table: &toml::Table) -> Result<Config, ConfigError> {
         },
         None => defaults.web_port,
     };
+    let server_url = match table.get("server_url") {
+        Some(v) => match v.as_str() {
+            Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => {
+                return Err(ConfigError(
+                    "server_url must be a non-empty string".to_string(),
+                ));
+            }
+        },
+        None => None,
+    };
     let check_interval = match table.get("check_interval") {
         Some(v) => parse_duration_value(v)?,
         None => defaults.check_interval,
@@ -261,8 +302,41 @@ pub fn config_from_table(table: &toml::Table) -> Result<Config, ConfigError> {
         log_file,
         web_host,
         web_port,
+        server_url,
         yt_dlp_command,
     })
+}
+
+fn apply_env_overrides(mut config: Config) -> Result<Config, ConfigError> {
+    if let Ok(root) = std::env::var("VDL_DOWNLOAD_ROOT")
+        && !root.trim().is_empty()
+    {
+        config.download_root = expand_tilde(root.trim());
+    }
+    if let Ok(log) = std::env::var("VDL_LOG_FILE")
+        && !log.trim().is_empty()
+    {
+        config.log_file = expand_tilde(log.trim());
+    }
+    if let Ok(host) = std::env::var("VDL_HOST")
+        && !host.trim().is_empty()
+    {
+        config.web_host = host.trim().to_string();
+    }
+    if let Ok(port_str) = std::env::var("VDL_PORT")
+        && !port_str.trim().is_empty()
+    {
+        let port: u16 = port_str
+            .trim()
+            .parse()
+            .ok()
+            .filter(|&p| p >= 1)
+            .ok_or_else(|| {
+                ConfigError("VDL_PORT must be an integer between 1 and 65535".to_string())
+            })?;
+        config.web_port = port;
+    }
+    Ok(config)
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<Config, ConfigError> {
@@ -270,15 +344,17 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, ConfigError> {
         Some(p) => expand_path(p),
         None => default_config_path(),
     };
-    if !config_path.exists() {
-        return Ok(Config::default());
-    }
-    let text = fs::read_to_string(&config_path)
-        .map_err(|e| ConfigError(format!("cannot read {}: {e}", config_path.display())))?;
-    let table: toml::Table = text
-        .parse()
-        .map_err(|e| ConfigError(format!("invalid TOML in {}: {e}", config_path.display())))?;
-    config_from_table(&table)
+    let config = if !config_path.exists() {
+        Config::default()
+    } else {
+        let text = fs::read_to_string(&config_path)
+            .map_err(|e| ConfigError(format!("cannot read {}: {e}", config_path.display())))?;
+        let table: toml::Table = text
+            .parse()
+            .map_err(|e| ConfigError(format!("invalid TOML in {}: {e}", config_path.display())))?;
+        config_from_table(&table)?
+    };
+    apply_env_overrides(config)
 }
 
 pub fn ensure_config(path: Option<&Path>) -> Result<PathBuf, ConfigError> {

@@ -1,0 +1,30 @@
+schema: 3
+id: vdl
+name: VDL
+image:
+  repository: ghcr.io/hipotures/vdl
+runtime:
+  telemetry: homestack
+  stop_timeout_seconds: 120
+  ports:
+    - name: http
+      port: 8780
+      protocol: tcp
+  healthcheck:
+    type: http
+    port: http
+    path: /health/ready
+    expected_status: 200
+    heartbeat_seconds: 60
+persistence:
+  mount: /home/app
+  size: 20G
+  directories:
+    - config
+    - downloads
+    - logs
+exposure:
+  pangolin:
+    port: http
+    name: VDL
+    subdomain: vdl

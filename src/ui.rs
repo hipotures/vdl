@@ -1,11 +1,7 @@
-//! Ratatui + Crossterm terminal UI with btop/homestack-style border-integrated
-//! hotkeys, mouse support, live filtering, sorting, optional log tail panel,
-//! and clean terminal restoration.
+//! Thin HTTP TUI client (`vdl` / `vdl tui`): talks to `vdl serve` over HTTP only.
+//! Never touches the server's filesystem directly.
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Stdout};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -26,10 +22,10 @@ use ratatui::widgets::{
     ScrollbarState, Table, TableState, Wrap,
 };
 
-use crate::config::Config;
+use crate::client::VdlClient;
 use crate::domain::format_age;
-use crate::repository::{SourceRepository, normalize_url};
-use crate::state::{AppSnapshot, SourceSnapshot, apply_action, snapshot};
+use crate::repository::normalize_url;
+use crate::state::{AppSnapshot, SourceSnapshot};
 
 const BORDER_FOCUSED: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
 const BORDER_UNFOCUSED: Color = Color::Rgb(0x41, 0x48, 0x68);
@@ -120,14 +116,11 @@ enum ButtonAction {
     ToggleLog,
     ToggleMouse,
     Refresh,
-    Detach,
     Quit,
     ConfirmDisable,
     CancelDisable,
 }
 
-/// Helper for building btop/homestack-style border titles with `┐`...`┌` (top)
-/// or `┘`...`└` (bottom) pills and clickable hit rects.
 struct BorderPills {
     spans: Vec<Span<'static>>,
     x: u16,
@@ -140,7 +133,7 @@ impl BorderPills {
     fn new(area_x: u16, y: u16, border_color: Color, top: bool) -> Self {
         Self {
             spans: Vec::new(),
-            x: area_x.saturating_add(1), // after left corner
+            x: area_x.saturating_add(1),
             y,
             border_style: Style::default().fg(border_color),
             top,
@@ -184,7 +177,6 @@ impl BorderPills {
         self.x = self.x.saturating_add((content_width + 2) as u16);
     }
 
-    /// Pill where the hotkey is the prefix of the label (e.g., `f` + `ilter`).
     fn push_hotkey_word(
         &mut self,
         key: &'static str,
@@ -215,7 +207,6 @@ impl BorderPills {
         );
     }
 
-    /// Pill where the hotkey is separate from the label (e.g., `F5` + ` refresh`).
     fn push_key_label(
         &mut self,
         key: &'static str,
@@ -257,7 +248,6 @@ fn right_pill(content: Vec<Span<'static>>, border_color: Color, top: bool) -> Li
     Line::from(spans)
 }
 
-/// UTF-8 safe single-line text input with cursor movement.
 #[derive(Debug, Default, Clone)]
 struct TextInput {
     text: String,
@@ -390,35 +380,6 @@ impl TextInput {
     }
 }
 
-fn read_log_tail(path: &Path, max_lines: usize) -> Vec<String> {
-    let Ok(mut file) = File::open(path) else {
-        return vec!["(no log file yet)".to_string()];
-    };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let read_size = len.min(16 * 1024);
-    if len > read_size && file.seek(SeekFrom::End(-(read_size as i64))).is_err() {
-        return Vec::new();
-    }
-    let mut buf = Vec::with_capacity(read_size as usize);
-    if file.read_to_end(&mut buf).is_err() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<String> = text
-        .lines()
-        .map(terminal_text)
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    if lines.len() > max_lines {
-        lines = lines.split_off(lines.len() - max_lines);
-    }
-    if lines.is_empty() {
-        vec!["(log is empty)".to_string()]
-    } else {
-        lines
-    }
-}
-
 fn filter_and_sort_sources(
     sources: &[SourceSnapshot],
     filter: &str,
@@ -476,8 +437,8 @@ fn filter_and_sort_sources(
 }
 
 struct TuiState {
-    repository: SourceRepository,
-    log_file: PathBuf,
+    client: VdlClient,
+    online: bool,
     snapshot: AppSnapshot,
     visible: Vec<SourceSnapshot>,
     url_input: TextInput,
@@ -499,12 +460,12 @@ struct TuiState {
 }
 
 impl TuiState {
-    fn new(repository: SourceRepository, log_file: PathBuf, mouse_override: Option<bool>) -> Self {
+    fn new(client: VdlClient, mouse_override: Option<bool>) -> Self {
         let mouse_enabled = mouse_override
             .unwrap_or_else(|| std::env::var("VDL_MOUSE").map(|v| v != "0").unwrap_or(true));
         let mut state = Self {
-            repository,
-            log_file,
+            client,
+            online: false,
             snapshot: AppSnapshot {
                 sources: Vec::new(),
                 download: None,
@@ -561,17 +522,36 @@ impl TuiState {
     }
 
     fn refresh(&mut self) {
-        match snapshot(&self.repository) {
+        match self.client.get_state() {
             Ok(snap) => {
+                if !self.online && self.message_is_error {
+                    self.message = None;
+                    self.message_is_error = false;
+                }
+                self.online = true;
                 self.snapshot = snap;
                 self.rebuild_visible();
             }
             Err(err) => {
-                self.set_error(format!("Refresh failed: {err}"));
+                self.online = false;
+                self.set_error(err);
             }
         }
         if self.show_log {
-            self.log_lines = read_log_tail(&self.log_file, LOG_TAIL_LINES);
+            match self.client.get_logs(LOG_TAIL_LINES) {
+                Ok(lines) => {
+                    self.log_lines = if lines.is_empty() {
+                        vec!["(no log lines yet)".to_string()]
+                    } else {
+                        lines.into_iter().map(|l| terminal_text(&l)).collect()
+                    };
+                }
+                Err(_) => {
+                    if self.log_lines.is_empty() {
+                        self.log_lines = vec!["(offline)".to_string()];
+                    }
+                }
+            }
         }
     }
 
@@ -619,27 +599,24 @@ impl TuiState {
 
     fn submit_url(&mut self) {
         let raw = self.url_input.as_str().to_string();
-        match self.repository.add_source(&raw) {
-            Ok(result) => {
-                let verb = if result.created {
+        match self.client.add_source(&raw) {
+            Ok(resp) => {
+                let verb = if resp.created {
                     "Added"
                 } else {
                     "Already exists"
                 };
-                let suffix = if result.source.active {
-                    ""
-                } else {
-                    " (inactive)"
-                };
-                let new_id = result.source.id();
-                self.set_info(format!("{verb}: {new_id}{suffix}"));
+                let suffix = if resp.active { "" } else { " (inactive)" };
+                self.set_info(format!("{verb}: {}{suffix}", resp.id));
                 self.url_input.clear();
-                self.selected = Some(new_id);
+                self.selected = Some(resp.id);
+                self.online = true;
+                self.snapshot = resp.state;
+                self.rebuild_visible();
                 self.focus = Focus::Table;
-                self.refresh();
             }
             Err(err) => {
-                self.set_error(err.to_string());
+                self.set_error(err);
             }
         }
     }
@@ -648,13 +625,15 @@ impl TuiState {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        match apply_action(&self.repository, "download-now", &id) {
-            Ok(()) => {
+        match self.client.apply_action("download-now", &id) {
+            Ok(snap) => {
                 self.set_info(format!("Download requested: {id}"));
-                self.refresh();
+                self.online = true;
+                self.snapshot = snap;
+                self.rebuild_visible();
             }
             Err(err) => {
-                self.set_error(err.to_string());
+                self.set_error(err);
             }
         }
     }
@@ -678,13 +657,15 @@ impl TuiState {
             return;
         };
         self.focus = Focus::Table;
-        match apply_action(&self.repository, "disable", &id) {
-            Ok(()) => {
+        match self.client.apply_action("disable", &id) {
+            Ok(snap) => {
                 self.set_info(format!("Disabled: {id}"));
-                self.refresh();
+                self.online = true;
+                self.snapshot = snap;
+                self.rebuild_visible();
             }
             Err(err) => {
-                self.set_error(err.to_string());
+                self.set_error(err);
             }
         }
     }
@@ -698,7 +679,7 @@ impl TuiState {
     fn toggle_log(&mut self) {
         self.show_log = !self.show_log;
         if self.show_log {
-            self.log_lines = read_log_tail(&self.log_file, LOG_TAIL_LINES);
+            self.refresh();
         }
     }
 
@@ -708,21 +689,6 @@ impl TuiState {
             let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
         } else {
             let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
-        }
-    }
-
-    fn detach(&mut self) {
-        match Command::new("tmux")
-            .args(["-L", "vdl", "detach-client", "-s", "main"])
-            .status()
-        {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
-                self.set_error(format!("Could not detach: tmux exited with {status}"));
-            }
-            Err(err) => {
-                self.set_error(format!("Could not detach: {err}"));
-            }
         }
     }
 
@@ -751,9 +717,10 @@ impl TuiState {
             ButtonAction::ToggleMouse => self.toggle_mouse(terminal),
             ButtonAction::Refresh => {
                 self.refresh();
-                self.set_info("Refreshed.");
+                if self.online {
+                    self.set_info("Refreshed.");
+                }
             }
-            ButtonAction::Detach => self.detach(),
             ButtonAction::Quit => self.should_quit = true,
             ButtonAction::ConfirmDisable => self.confirm_disable(),
             ButtonAction::CancelDisable => self.cancel_disable(),
@@ -777,11 +744,9 @@ impl TuiState {
             }
             KeyCode::F(5) => {
                 self.refresh();
-                self.set_info("Refreshed.");
-                return;
-            }
-            KeyCode::F(6) => {
-                self.detach();
+                if self.online {
+                    self.set_info("Refreshed.");
+                }
                 return;
             }
             KeyCode::Tab | KeyCode::BackTab => {
@@ -879,7 +844,9 @@ impl TuiState {
                 KeyCode::Char('d') => self.ask_disable(),
                 KeyCode::Char('r') => {
                     self.refresh();
-                    self.set_info("Refreshed.");
+                    if self.online {
+                        self.set_info("Refreshed.");
+                    }
                 }
                 KeyCode::Esc if !self.filter_input.is_empty() => {
                     self.filter_input.clear();
@@ -960,10 +927,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     state.buttons.clear();
     let area = frame.area();
 
-    let mut constraints = vec![
-        Constraint::Length(3), // ¹vdl / URL or Filter input panel
-        Constraint::Min(5),    // ²sources panel
-    ];
+    let mut constraints = vec![Constraint::Length(3), Constraint::Min(5)];
     if state.show_log {
         constraints.push(Constraint::Length((LOG_TAIL_LINES + 2) as u16));
     }
@@ -1046,7 +1010,14 @@ fn render_top_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiS
 
     let total = state.snapshot.sources.len();
     let active = state.snapshot.sources.iter().filter(|s| s.active).count();
-    let status_spans = if let Some(ref busy) = state.snapshot.download {
+    let host_label = state.client.display_host();
+    let status_spans = if !state.online {
+        vec![
+            Span::styled("■ ", Style::default().fg(HOTKEY_COLOR)),
+            Span::styled("offline ", Style::default().fg(HOTKEY_COLOR)),
+            Span::styled(format!("· {host_label}"), Style::default().fg(MUTED)),
+        ]
+    } else if let Some(ref busy) = state.snapshot.download {
         vec![
             Span::styled(
                 format!("⬇ {} ", terminal_text(busy)),
@@ -1055,28 +1026,19 @@ fn render_top_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiS
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("· {} pending", state.snapshot.pending),
-                Style::default().fg(MUTED),
-            ),
-        ]
-    } else if state.snapshot.owner_running {
-        vec![
-            Span::styled("● ", Style::default().fg(Color::Rgb(0x73, 0xda, 0xca))),
-            Span::styled("ready ", Style::default().fg(TEXT_PRIMARY)),
-            Span::styled(
-                format!(
-                    "· {active}/{total} active · {} pending",
-                    state.snapshot.pending
-                ),
+                format!("· {} pending · {host_label}", state.snapshot.pending),
                 Style::default().fg(MUTED),
             ),
         ]
     } else {
         vec![
-            Span::styled("■ ", Style::default().fg(HOTKEY_COLOR)),
-            Span::styled("stopped ", Style::default().fg(HOTKEY_COLOR)),
+            Span::styled("● ", Style::default().fg(Color::Rgb(0x73, 0xda, 0xca))),
+            Span::styled("ready ", Style::default().fg(TEXT_PRIMARY)),
             Span::styled(
-                format!("· {active}/{total} active"),
+                format!(
+                    "· {active}/{total} active · {} pending · {host_label}",
+                    state.snapshot.pending
+                ),
                 Style::default().fg(MUTED),
             ),
         ]
@@ -1088,7 +1050,6 @@ fn render_top_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiS
         .title_top(top.finish())
         .title_top(right_pill(status_spans, border_color, true).alignment(Alignment::Right));
 
-    // Bottom border of top panel shows normalized URL preview or status message
     if !is_filter && !state.url_input.is_empty() {
         let preview_span = match normalize_url(state.url_input.as_str()) {
             Ok(clean) => Span::styled(
@@ -1230,12 +1191,6 @@ fn render_sources_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
         Some(ButtonAction::Refresh),
         &mut state.buttons,
     );
-    bottom.push_key_label(
-        "F6",
-        "detach".to_string(),
-        Some(ButtonAction::Detach),
-        &mut state.buttons,
-    );
     bottom.push_hotkey_word("q", "uit", false, ButtonAction::Quit, &mut state.buttons);
 
     let count_text = if visible_len == 0 {
@@ -1278,7 +1233,9 @@ fn render_sources_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
     }
 
     if state.visible.is_empty() {
-        let empty_msg = if state.filter_input.is_empty() {
+        let empty_msg = if !state.online {
+            "Server unreachable. Start `vdl serve` or pass `--server URL`."
+        } else if state.filter_input.is_empty() {
             "No sources yet. Press 'a' to add a URL."
         } else {
             "No sources match the current filter. Press Esc to clear."
@@ -1420,7 +1377,7 @@ fn render_log_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiS
         .title_top(
             right_pill(
                 vec![Span::styled(
-                    state.log_file.display().to_string(),
+                    format!("{}/api/logs", state.client.base_url()),
                     Style::default().fg(MUTED),
                 )],
                 border_color,
@@ -1502,9 +1459,9 @@ fn render_confirm_modal(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
     );
 }
 
-pub fn run_tui(config: Config, mouse_override: Option<bool>) -> Result<(), String> {
-    let repository = SourceRepository::new(&config.download_root).map_err(|e| e.to_string())?;
-    let mut state = TuiState::new(repository, config.log_file, mouse_override);
+pub fn run_tui(server_url: String, mouse_override: Option<bool>) -> Result<(), String> {
+    let client = VdlClient::new(server_url)?;
+    let mut state = TuiState::new(client, mouse_override);
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();

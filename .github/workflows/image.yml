@@ -1,0 +1,43 @@
+name: Publish VDL container image
+
+on:
+  push:
+    tags:
+      - "vdl-[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/vdl-* ]]; then
+            TAG="${GITHUB_REF#refs/tags/vdl-}"
+          else
+            TAG="dev-${GITHUB_SHA::12}"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/container/Containerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/hipotures/vdl:${{ steps.meta.outputs.tag }}

@@ -1,7 +1,0 @@
-bin.name = "vdl"
-args = ["list"]
-env.add.HOME = "home"
-env.add.XDG_RUNTIME_DIR = "runtime"
-status.code = 0
-fs.sandbox = true
-fs.base = "list-populated.in"

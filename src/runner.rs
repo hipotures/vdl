@@ -1,11 +1,11 @@
-//! Run the configured yt-dlp command for one source.
+//! Run the configured yt-dlp command for one source and keep a ring buffer of log lines.
 
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
@@ -14,9 +14,11 @@ use tokio::process::{Child, Command};
 use crate::config::{Config, DEFAULT_LOG_FILE, expand_path};
 use crate::repository::{LAST_CHECK_FILE, Source};
 
+const RING_CAPACITY: usize = 500;
+
 pub struct AppLogger {
     path: PathBuf,
-    lock: Mutex<()>,
+    ring: Mutex<VecDeque<String>>,
 }
 
 impl AppLogger {
@@ -26,7 +28,7 @@ impl AppLogger {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_FILE));
         Self {
             path,
-            lock: Mutex::new(()),
+            ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
         }
     }
 
@@ -38,20 +40,32 @@ impl AppLogger {
         self.write_line("ERROR", message);
     }
 
+    pub fn recent(&self, limit: usize) -> Vec<String> {
+        let guard = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = guard.len().saturating_sub(limit);
+        guard.iter().skip(skip).cloned().collect()
+    }
+
     fn write_line(&self, level: &str, message: &str) {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let ts = format_timestamp();
+        let formatted = format!("{ts} {level} {message}");
+        {
+            let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+            if ring.len() >= RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(formatted.clone());
+        }
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let Ok(mut file) = OpenOptions::new()
+        if let Ok(mut file) = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
-        else {
-            return;
-        };
-        let ts = format_timestamp();
-        let _ = writeln!(file, "{ts} {level} {message}");
+        {
+            let _ = writeln!(file, "{formatted}");
+        }
     }
 }
 
@@ -65,11 +79,11 @@ fn format_timestamp() -> String {
 
 pub struct YtDlpRunner {
     command: Vec<String>,
-    logger: std::sync::Arc<AppLogger>,
+    logger: Arc<AppLogger>,
 }
 
 impl YtDlpRunner {
-    pub fn new(config: &Config, logger: std::sync::Arc<AppLogger>) -> Result<Self, io::Error> {
+    pub fn new(config: &Config, logger: Arc<AppLogger>) -> Result<Self, io::Error> {
         if config.yt_dlp_command.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -83,10 +97,7 @@ impl YtDlpRunner {
     }
 
     #[cfg(test)]
-    pub fn from_command(
-        command: Vec<String>,
-        logger: std::sync::Arc<AppLogger>,
-    ) -> Result<Self, io::Error> {
+    pub fn from_command(command: Vec<String>, logger: Arc<AppLogger>) -> Result<Self, io::Error> {
         if command.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -96,7 +107,7 @@ impl YtDlpRunner {
         Ok(Self { command, logger })
     }
 
-    pub async fn run(&self, source: &Source, pass_fd: Option<RawFd>) -> io::Result<i32> {
+    pub async fn run(&self, source: &Source) -> io::Result<i32> {
         let source_path = &source.path;
         let marker = source_path.join(LAST_CHECK_FILE);
         touch_file(&marker)?;
@@ -118,18 +129,11 @@ impl YtDlpRunner {
             .stdout(Stdio::from(write_pipe))
             .stderr(Stdio::from(write_pipe_err));
 
-        // SAFETY: `pre_exec` runs in the forked child before `exec`. Only async-signal-safe
-        // libc calls (`setsid`, `fcntl`) are invoked.
+        // SAFETY: `pre_exec` runs in the forked child before `exec` and only calls `setsid`.
         unsafe {
-            cmd.pre_exec(move || {
+            cmd.pre_exec(|| {
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
-                }
-                if let Some(fd) = pass_fd {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags != -1 {
-                        let _ = libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                    }
                 }
                 Ok(())
             });
@@ -146,7 +150,6 @@ impl YtDlpRunner {
             }
         };
 
-        // Drop parent's copies of write ends via cmd drop so EOF arrives when child exits.
         drop(cmd);
 
         let mut reader = tokio::fs::File::from_std(read_pipe);
@@ -261,19 +264,16 @@ async fn stop_process(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
 
     use tempfile::TempDir;
 
     use super::*;
     use crate::repository::SourceRepository;
-    use crate::runtime::RuntimePaths;
 
     #[tokio::test]
     async fn runner_executes_command_touches_marker_and_logs_output() {
         let tmp = TempDir::new().unwrap();
-        let runtime = RuntimePaths::from_dir(tmp.path().join("rt"));
-        let repo = SourceRepository::with_runtime(tmp.path().join("downloads"), runtime);
+        let repo = SourceRepository::new(tmp.path().join("downloads"));
         let source = repo
             .add_source("https://example.test/account")
             .unwrap()
@@ -300,11 +300,11 @@ mod tests {
                 "--download-archive".to_string(),
                 ".archive".to_string(),
             ],
-            logger,
+            Arc::clone(&logger),
         )
         .unwrap();
 
-        let code = runner.run(&source, None).await.unwrap();
+        let code = runner.run(&source).await.unwrap();
         assert_eq!(code, 0);
         assert!(source.path.join(".last-check").exists());
         assert!(source.path.join(".archive").exists());
@@ -314,5 +314,6 @@ mod tests {
         assert!(log.contains("fake stderr"));
         assert!(log.contains("args:--download-archive .archive https://example.test/account"));
         assert!(log.contains("yt-dlp exit code=0"));
+        assert!(!logger.recent(10).is_empty());
     }
 }

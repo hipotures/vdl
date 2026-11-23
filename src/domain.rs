@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::repository::{RepoError, Source, SourceRepository, display_service};
+use crate::repository::RepoError;
+use crate::state::SourceSnapshot;
 
 pub fn parse_source_numbers(values: &[String]) -> Result<Vec<usize>, RepoError> {
     let joined = values.join(" ");
@@ -35,10 +36,10 @@ pub fn parse_source_numbers(values: &[String]) -> Result<Vec<usize>, RepoError> 
     Ok(out)
 }
 
-pub fn resolve_source_numbers(
-    sources: &[Source],
+pub fn resolve_snapshot_numbers(
+    sources: &[SourceSnapshot],
     values: &[String],
-) -> Result<Vec<Source>, RepoError> {
+) -> Result<Vec<(usize, SourceSnapshot)>, RepoError> {
     let numbers = parse_source_numbers(values)?;
     let invalid: Vec<String> = numbers
         .iter()
@@ -53,21 +54,8 @@ pub fn resolve_source_numbers(
     }
     Ok(numbers
         .into_iter()
-        .map(|n| sources[n - 1].clone())
+        .map(|n| (n, sources[n - 1].clone()))
         .collect())
-}
-
-pub fn disable_sources(
-    repository: &SourceRepository,
-    sources: &[Source],
-) -> Result<Vec<Source>, RepoError> {
-    let mut disabled = Vec::new();
-    for source in sources {
-        if source.active {
-            disabled.push(repository.disable(source)?);
-        }
-    }
-    Ok(disabled)
 }
 
 pub fn now_unix() -> f64 {
@@ -102,7 +90,7 @@ pub fn format_age(last_check: Option<f64>, now: Option<f64>) -> String {
     format!("{days}d {rem_h}h ago")
 }
 
-pub fn format_sources_table(sources: &[Source], numbers: Option<&[usize]>) -> String {
+pub fn format_snapshots_table(sources: &[SourceSnapshot], numbers: Option<&[usize]>) -> String {
     let headers = ["#", "Service", "Account", "Last check", "State"];
     let default_nums: Vec<usize> = (1..=sources.len()).collect();
     let nums = numbers.unwrap_or(&default_nums);
@@ -112,14 +100,10 @@ pub fn format_sources_table(sources: &[Source], numbers: Option<&[usize]>) -> St
         .map(|(&num, src)| {
             [
                 num.to_string(),
-                display_service(&src.service),
+                src.service.clone(),
                 src.account.clone(),
                 format_age(src.last_check, None),
-                if src.active {
-                    "active".to_string()
-                } else {
-                    "inactive".to_string()
-                },
+                src.state.clone(),
             ]
         })
         .collect();

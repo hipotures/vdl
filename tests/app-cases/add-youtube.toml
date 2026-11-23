@@ -1,7 +1,0 @@
-bin.name = "vdl"
-args = ["add", "https://www.youtube.com/@example/videos?si=123"]
-env.add.HOME = "home"
-env.add.XDG_RUNTIME_DIR = "runtime"
-status.code = 0
-fs.sandbox = true
-fs.base = "add-youtube.in"

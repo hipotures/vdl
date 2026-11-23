@@ -1,0 +1,34 @@
+# VDL server image for HomeStack (unprivileged Proxmox LXC from this OCI image).
+# Runtime contract: deploy/container/README.md.
+# Build from the repository root:
+#   podman build -f deploy/container/Containerfile -t vdl:dev .
+
+FROM docker.io/library/rust:1-slim-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY static ./static
+RUN cargo build --release --locked
+
+FROM docker.io/library/debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg python3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL -o /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+ && chmod 0755 /usr/local/bin/yt-dlp \
+ && yt-dlp --version >/dev/null \
+ && ffmpeg -version >/dev/null
+
+COPY --from=builder /build/target/release/vdl /usr/local/bin/vdl
+COPY --chmod=0755 deploy/container/entrypoint.sh /usr/local/bin/vdl-entrypoint
+
+# Persistent home volume (mp0) is mounted here by HomeStack; must remain a real, empty directory.
+RUN mkdir -p /home/app
+
+ENV VDL_HOME=/home/app \
+    VDL_HOST=0.0.0.0 \
+    VDL_PORT=8780
+
+EXPOSE 8780
+ENTRYPOINT ["/usr/local/bin/vdl-entrypoint"]

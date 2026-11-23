@@ -1,15 +1,15 @@
-//! Filesystem sources and pending requests; no separate queue database.
+//! Filesystem sources and pending requests; owned exclusively by `vdl serve`.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use url::Url;
 
 use crate::config::expand_path;
-use crate::runtime::{FileLock, RuntimePaths, current_download, set_busy};
 
 pub const SOURCE_FILE: &str = ".source";
 pub const DISABLED_SOURCE_FILE: &str = ".source.del";
@@ -137,23 +137,25 @@ pub struct AddResult {
 #[derive(Debug, Clone)]
 pub struct SourceRepository {
     pub download_root: PathBuf,
-    pub runtime: RuntimePaths,
+    mutation_lock: Arc<Mutex<()>>,
+    busy: Arc<Mutex<Option<String>>>,
 }
 
 impl SourceRepository {
-    pub fn new(download_root: impl AsRef<Path>) -> io::Result<Self> {
-        let runtime = RuntimePaths::resolve()?;
-        Ok(Self {
-            download_root: expand_path(download_root.as_ref()),
-            runtime,
-        })
-    }
-
-    pub fn with_runtime(download_root: impl AsRef<Path>, runtime: RuntimePaths) -> Self {
+    pub fn new(download_root: impl AsRef<Path>) -> Self {
         Self {
             download_root: expand_path(download_root.as_ref()),
-            runtime,
+            mutation_lock: Arc::new(Mutex::new(())),
+            busy: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn current_download(&self) -> Option<String> {
+        self.busy.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_busy(&self, label: Option<String>) {
+        *self.busy.lock().unwrap_or_else(|e| e.into_inner()) = label;
     }
 
     pub fn list_sources(&self) -> Vec<Source> {
@@ -201,7 +203,7 @@ impl SourceRepository {
         let url = normalize_url(raw_url)?;
         let (service, account) = derive_source_location(&url)?;
         let candidate = self.download_root.join(&service).join(&account);
-        let _lock = FileLock::acquire(&self.runtime.mutation_lock, true)?;
+        let _lock = self.mutation_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = self.source_at(&candidate)? {
             if existing.url == url {
                 return Ok(AddResult {
@@ -233,7 +235,7 @@ impl SourceRepository {
     }
 
     pub fn disable(&self, source: &Source) -> Result<Source, RepoError> {
-        let _lock = FileLock::acquire(&self.runtime.mutation_lock, true)?;
+        let _lock = self.mutation_lock.lock().unwrap_or_else(|e| e.into_inner());
         let Some(current) = self.source_at(&source.path)? else {
             return Err(RepoError::NotFound("source marker disappeared".to_string()));
         };
@@ -251,14 +253,14 @@ impl SourceRepository {
     }
 
     pub fn request_download(&self, source: &Source) -> Result<Source, RepoError> {
-        let _lock = FileLock::acquire(&self.runtime.mutation_lock, true)?;
+        let _lock = self.mutation_lock.lock().unwrap_or_else(|e| e.into_inner());
         let Some(current) = self.source_at(&source.path)? else {
             return Err(RepoError::NotFound("source marker disappeared".to_string()));
         };
         if !current.active {
             return Err(RepoError::Value("source is inactive".to_string()));
         }
-        if current_download(&self.runtime).as_deref() != Some(current.id().as_str()) {
+        if self.current_download().as_deref() != Some(current.id().as_str()) {
             let marker = current.path.join(DOWNLOAD_NOW_FILE);
             match OpenOptions::new()
                 .write(true)
@@ -276,18 +278,23 @@ impl SourceRepository {
         Ok(updated)
     }
 
-    pub fn claim_next<F>(&self, select: F) -> io::Result<Option<Source>>
+    pub fn claim_next<F>(&self, select: F) -> Option<Source>
     where
         F: FnOnce(&[Source]) -> Option<Source>,
     {
-        let _lock = FileLock::acquire(&self.runtime.mutation_lock, true)?;
+        let _lock = self.mutation_lock.lock().unwrap_or_else(|e| e.into_inner());
         let sources = self.list_sources();
         let selected = select(&sources);
         if let Some(ref source) = selected {
-            set_busy(&self.runtime, Some(&source.id()))?;
+            self.set_busy(Some(source.id()));
             let _ = remove_if_exists(&source.path.join(DOWNLOAD_NOW_FILE));
         }
-        Ok(selected)
+        selected
+    }
+
+    pub fn snapshot_sources(&self) -> (Vec<Source>, Option<String>) {
+        let _lock = self.mutation_lock.lock().unwrap_or_else(|e| e.into_inner());
+        (self.list_sources(), self.current_download())
     }
 }
 
