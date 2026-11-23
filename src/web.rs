@@ -166,6 +166,24 @@ async fn get_logs(
     (StatusCode::OK, Json(json!({ "lines": lines }))).into_response()
 }
 
+async fn get_source_info(
+    State(state): State<WebState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(source_id) = params.get("id").filter(|s| !s.trim().is_empty()).cloned() else {
+        return json_error(StatusCode::BAD_REQUEST, "query parameter 'id' is required");
+    };
+    let repo = state.repository.clone();
+    match tokio::task::spawn_blocking(move || repo.source_info(&source_id)).await {
+        Ok(Ok(info)) => (StatusCode::OK, Json(info)).into_response(),
+        Ok(Err(err)) => repo_error_response(err, &state.logger),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Filesystem operation failed; check the vdl log",
+        ),
+    }
+}
+
 async fn post_source(State(state): State<WebState>, body: axum::body::Bytes) -> Response {
     let Ok(data) = serde_json::from_slice::<Value>(&body) else {
         return json_error(StatusCode::BAD_REQUEST, "invalid JSON body");
@@ -320,6 +338,7 @@ pub fn create_router(
         )
         .route("/api/state", get(get_state))
         .route("/api/logs", get(get_logs))
+        .route("/api/sources/info", get(get_source_info))
         .route("/api/sources", post(post_source))
         .route("/api/sources/{action}", post(post_action))
         .route("/health/live", get(get_health_live))

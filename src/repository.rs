@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::config::expand_path;
@@ -132,6 +133,22 @@ impl Source {
 pub struct AddResult {
     pub source: Source,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceInfo {
+    pub id: String,
+    pub service: String,
+    pub account: String,
+    pub url: String,
+    pub active: bool,
+    pub state: String,
+    pub last_check: Option<f64>,
+    pub path: String,
+    pub file_count: u64,
+    pub total_bytes: u64,
+    pub archive_entries: u64,
+    pub newest_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +312,76 @@ impl SourceRepository {
     pub fn snapshot_sources(&self) -> (Vec<Source>, Option<String>) {
         let _lock = self.mutation_lock.lock().unwrap_or_else(|e| e.into_inner());
         (self.list_sources(), self.current_download())
+    }
+
+    pub fn source_info(&self, source_id: &str) -> Result<SourceInfo, RepoError> {
+        let (sources, busy) = self.snapshot_sources();
+        let Some(source) = sources.into_iter().find(|s| s.id() == source_id) else {
+            return Err(RepoError::NotFound(
+                "source no longer exists; refresh and try again".to_string(),
+            ));
+        };
+        let id = source.id();
+        let running = busy.as_deref() == Some(id.as_str());
+        let pending = source.active && (source.download_requested || source.last_check.is_none());
+        let state = if running {
+            if source.active {
+                "downloading"
+            } else {
+                "finishing"
+            }
+        } else if pending {
+            "queued"
+        } else if source.active {
+            "active"
+        } else {
+            "inactive"
+        };
+
+        let mut file_count: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut newest: Option<(std::time::SystemTime, String)> = None;
+
+        if let Ok(entries) = fs::read_dir(&source.path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                file_count += 1;
+                total_bytes = total_bytes.saturating_add(meta.len());
+                if let Ok(mtime) = meta.modified()
+                    && newest.as_ref().is_none_or(|(prev, _)| mtime > *prev)
+                {
+                    newest = Some((mtime, name));
+                }
+            }
+        }
+
+        let archive_entries = fs::read_to_string(source.path.join(".archive"))
+            .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+            .unwrap_or(0);
+
+        Ok(SourceInfo {
+            id,
+            service: display_service(&source.service),
+            account: source.account,
+            url: source.url,
+            active: source.active,
+            state: state.to_string(),
+            last_check: source.last_check,
+            path: source.path.display().to_string(),
+            file_count,
+            total_bytes,
+            archive_entries,
+            newest_file: newest.map(|(_, name)| name),
+        })
     }
 }
 

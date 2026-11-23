@@ -26,7 +26,7 @@ use ratatui::widgets::{
 
 use crate::client::VdlClient;
 use crate::domain::format_age;
-use crate::repository::normalize_url;
+use crate::repository::{SourceInfo, normalize_url};
 use crate::state::{AppSnapshot, SourceSnapshot};
 
 const BORDER_FOCUSED: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
@@ -43,6 +43,21 @@ fn terminal_text(value: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut val = bytes as f64;
+    let mut idx = 0;
+    while val >= 1024.0 && idx + 1 < UNITS.len() {
+        val /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{val:.2} {}", UNITS[idx])
+    }
 }
 
 fn state_style(state: &str) -> Style {
@@ -74,6 +89,7 @@ enum Focus {
     Url,
     Filter,
     Confirm,
+    Info,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +137,8 @@ enum ButtonAction {
     Quit,
     ConfirmDisable,
     CancelDisable,
+    OpenInfo,
+    CloseInfo,
 }
 
 struct BorderPills {
@@ -450,6 +468,7 @@ struct TuiState {
     log_lines: Vec<String>,
     selected: Option<String>,
     confirm_id: Option<String>,
+    info_modal: Option<SourceInfo>,
     message: Option<String>,
     message_is_error: bool,
     mouse_enabled: bool,
@@ -483,6 +502,7 @@ impl TuiState {
             log_lines: Vec::new(),
             selected: None,
             confirm_id: None,
+            info_modal: None,
             message: None,
             message_is_error: false,
             mouse_enabled,
@@ -654,6 +674,26 @@ impl TuiState {
         self.focus = Focus::Table;
     }
 
+    fn open_info(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        match self.client.get_source_info(&id) {
+            Ok(info) => {
+                self.info_modal = Some(info);
+                self.focus = Focus::Info;
+            }
+            Err(err) => {
+                self.set_error(err);
+            }
+        }
+    }
+
+    fn close_info(&mut self) {
+        self.info_modal = None;
+        self.focus = Focus::Table;
+    }
+
     fn confirm_disable(&mut self) {
         let Some(id) = self.confirm_id.take() else {
             return;
@@ -726,6 +766,8 @@ impl TuiState {
             ButtonAction::Quit => self.should_quit = true,
             ButtonAction::ConfirmDisable => self.confirm_disable(),
             ButtonAction::CancelDisable => self.cancel_disable(),
+            ButtonAction::OpenInfo => self.open_info(),
+            ButtonAction::CloseInfo => self.close_info(),
         }
     }
 
@@ -752,13 +794,14 @@ impl TuiState {
                 return;
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                if self.focus == Focus::Confirm {
+                if matches!(self.focus, Focus::Confirm | Focus::Info) {
                     return;
                 }
                 self.focus = match self.focus {
                     Focus::Table => Focus::Url,
                     Focus::Url | Focus::Filter => Focus::Table,
                     Focus::Confirm => Focus::Confirm,
+                    Focus::Info => Focus::Info,
                 };
                 return;
             }
@@ -766,6 +809,18 @@ impl TuiState {
         }
 
         match self.focus {
+            Focus::Info => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close_info(),
+                KeyCode::Char('n') => {
+                    self.close_info();
+                    self.trigger_download();
+                }
+                KeyCode::Char('d') => {
+                    self.close_info();
+                    self.ask_disable();
+                }
+                _ => {}
+            },
             Focus::Confirm => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_disable(),
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => self.cancel_disable(),
@@ -831,6 +886,7 @@ impl TuiState {
             Focus::Table => match key.code {
                 KeyCode::Char('1') => self.focus = Focus::Url,
                 KeyCode::Char('2') => self.focus = Focus::Table,
+                KeyCode::Enter => self.open_info(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 KeyCode::PageUp => self.move_selection(-10),
@@ -877,7 +933,7 @@ impl TuiState {
                         return;
                     }
                 }
-                if self.confirm_id.is_some() {
+                if self.confirm_id.is_some() || self.info_modal.is_some() {
                     return;
                 }
                 if rect_contains(self.input_area, col, row) {
@@ -946,6 +1002,8 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     }
     if state.confirm_id.is_some() {
         render_confirm_modal(frame, area, state);
+    } else if state.info_modal.is_some() {
+        render_info_modal(frame, area, state);
     }
 }
 
@@ -1181,6 +1239,12 @@ fn render_sources_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
     let bottom_y = area.y + area.height.saturating_sub(1);
     let mut bottom = BorderPills::new(area.x, bottom_y, border_color, false);
     bottom.push_key_label("↑↓", "select".to_string(), None, &mut state.buttons);
+    bottom.push_key_label(
+        "ENTER",
+        "info".to_string(),
+        Some(ButtonAction::OpenInfo),
+        &mut state.buttons,
+    );
     bottom.push_key_label(
         "F2",
         format!("mouse {}", if state.mouse_enabled { "on" } else { "off" }),
@@ -1459,6 +1523,117 @@ fn render_confirm_modal(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
             .wrap(Wrap { trim: true }),
         rows[1],
     );
+}
+
+fn render_info_modal(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
+    let Some(info) = state.info_modal.clone() else {
+        return;
+    };
+    let popup = centered_rect(68, 12, area);
+    frame.render_widget(Clear, popup);
+
+    let border_color = BORDER_FOCUSED;
+    let mut top = BorderPills::new(popup.x, popup.y, border_color, true);
+    top.push_pill(
+        vec![Span::styled(
+            format!(
+                " {} / {} ",
+                terminal_text(&info.service),
+                terminal_text(&info.account)
+            ),
+            Style::default()
+                .fg(TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        )],
+        None,
+        &mut state.buttons,
+    );
+
+    let bottom_y = popup.y + popup.height.saturating_sub(1);
+    let mut bottom = BorderPills::new(popup.x, bottom_y, border_color, false);
+    bottom.push_key_label(
+        "ESC",
+        "close".to_string(),
+        Some(ButtonAction::CloseInfo),
+        &mut state.buttons,
+    );
+    bottom.push_hotkey_word(
+        "n",
+        "ow",
+        false,
+        ButtonAction::DownloadNow,
+        &mut state.buttons,
+    );
+    bottom.push_hotkey_word(
+        "d",
+        "isable",
+        false,
+        ButtonAction::Disable,
+        &mut state.buttons,
+    );
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title_top(top.finish())
+        .title_top(
+            right_pill(
+                vec![Span::styled(info.state.clone(), state_style(&info.state))],
+                border_color,
+                true,
+            )
+            .alignment(Alignment::Right),
+        )
+        .title_bottom(bottom.finish());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let label_style = Style::default().fg(MUTED);
+    let value_style = Style::default().fg(TEXT_PRIMARY);
+    let accent_style = Style::default()
+        .fg(Color::Rgb(0x73, 0xda, 0xca))
+        .add_modifier(Modifier::BOLD);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("  Files:    ", label_style),
+            Span::styled(
+                format!("{}  ({})", info.file_count, format_bytes(info.total_bytes)),
+                accent_style,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Archive:  ", label_style),
+            Span::styled(
+                format!("{} recorded entries", info.archive_entries),
+                value_style,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Checked:  ", label_style),
+            Span::styled(format_age(info.last_check, None), value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("  Newest:   ", label_style),
+            Span::styled(
+                info.newest_file
+                    .as_deref()
+                    .map(terminal_text)
+                    .unwrap_or_else(|| "—".to_string()),
+                value_style,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  URL:      ", label_style),
+            Span::styled(terminal_text(&info.url), Style::default().fg(MSG_COLOR)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Path:     ", label_style),
+            Span::styled(terminal_text(&info.path), label_style),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 pub fn run_tui(server_url: String, mouse_override: Option<bool>) -> Result<(), String> {

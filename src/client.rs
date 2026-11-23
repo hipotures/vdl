@@ -7,6 +7,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::repository::SourceInfo;
 use crate::state::AppSnapshot;
 
 #[derive(Debug, Clone)]
@@ -74,6 +75,17 @@ impl VdlClient {
             .map_err(|e| format!("cannot reach {}: {e}", self.base_url))?;
         let parsed: LogsResponse = parse_json_response(resp)?;
         Ok(parsed.lines)
+    }
+
+    pub fn get_source_info(&self, source_id: &str) -> Result<SourceInfo, String> {
+        let url = format!("{}/api/sources/info", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("id", source_id)])
+            .send()
+            .map_err(|e| format!("cannot reach {}: {e}", self.base_url))?;
+        parse_json_response(resp)
     }
 
     pub fn add_source(&self, source_url: &str) -> Result<AddResponse, String> {
