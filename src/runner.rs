@@ -15,9 +15,11 @@ use crate::config::{Config, DEFAULT_LOG_FILE, expand_path};
 use crate::repository::{LAST_CHECK_FILE, Source};
 
 const RING_CAPACITY: usize = 500;
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB per file (1 backup -> <= 10 MiB total)
 
 pub struct AppLogger {
     path: PathBuf,
+    max_bytes: u64,
     ring: Mutex<VecDeque<String>>,
 }
 
@@ -28,6 +30,16 @@ impl AppLogger {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_FILE));
         Self {
             path,
+            max_bytes: MAX_LOG_BYTES,
+            ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_max_bytes(log_file: &Path, max_bytes: u64) -> Self {
+        Self {
+            path: expand_path(log_file),
+            max_bytes,
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
         }
     }
@@ -46,19 +58,29 @@ impl AppLogger {
         guard.iter().skip(skip).cloned().collect()
     }
 
+    fn rotate_if_needed(&self) {
+        if let Ok(meta) = fs::metadata(&self.path)
+            && meta.len() >= self.max_bytes
+        {
+            let mut backup = self.path.as_os_str().to_os_string();
+            backup.push(".1");
+            let _ = fs::rename(&self.path, PathBuf::from(backup));
+        }
+    }
+
     fn write_line(&self, level: &str, message: &str) {
         let ts = format_timestamp();
         let formatted = format!("{ts} {level} {message}");
-        {
-            let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-            if ring.len() >= RING_CAPACITY {
-                ring.pop_front();
-            }
-            ring.push_back(formatted.clone());
+        let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+        if ring.len() >= RING_CAPACITY {
+            ring.pop_front();
         }
+        ring.push_back(formatted.clone());
+
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        self.rotate_if_needed();
         if let Ok(mut file) = OpenOptions::new()
             .create(true)
             .append(true)
@@ -315,5 +337,21 @@ mod tests {
         assert!(log.contains("args:--download-archive .archive https://example.test/account"));
         assert!(log.contains("yt-dlp exit code=0"));
         assert!(!logger.recent(10).is_empty());
+    }
+
+    #[test]
+    fn logger_rotates_file_when_exceeding_max_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("vdl.log");
+        let backup_path = tmp.path().join("vdl.log.1");
+        let logger = AppLogger::with_max_bytes(&log_path, 128);
+
+        for i in 0..10 {
+            logger.info(&format!("line-{i}-padding-to-exceed-threshold"));
+        }
+
+        assert!(log_path.exists());
+        assert!(backup_path.exists());
+        assert!(fs::metadata(&log_path).unwrap().len() < 256);
     }
 }
