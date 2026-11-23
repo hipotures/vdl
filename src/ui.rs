@@ -4,14 +4,16 @@
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{execute, queue};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -1465,18 +1467,34 @@ pub fn run_tui(server_url: String, mouse_override: Option<bool>) -> Result<(), S
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|e| e.to_string())?;
+    // Queue BeginSynchronizedUpdate + EnterAlternateScreen without flushing so
+    // the terminal swaps atomically to the first rendered frame with zero blank blink.
+    queue!(stdout, BeginSynchronizedUpdate, EnterAlternateScreen, Hide)
+        .map_err(|e| e.to_string())?;
     if state.mouse_enabled {
-        let _ = execute!(stdout, EnableMouseCapture);
+        let _ = queue!(stdout, EnableMouseCapture);
     }
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
     let mut last_refresh = Instant::now();
+    let mut first_frame = true;
+    let mut dirty = true;
 
     let run_res = loop {
-        if let Err(err) = terminal.draw(|frame| draw_ui(frame, &mut state)) {
-            break Err(err.to_string());
+        if dirty {
+            if !first_frame {
+                let _ = queue!(terminal.backend_mut(), BeginSynchronizedUpdate);
+            }
+            let draw_res = terminal
+                .draw(|frame| draw_ui(frame, &mut state))
+                .map(|_| ());
+            let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            if let Err(err) = draw_res {
+                break Err(err.to_string());
+            }
+            first_frame = false;
+            dirty = false;
         }
         if state.should_quit {
             break Ok(());
@@ -1484,20 +1502,33 @@ pub fn run_tui(server_url: String, mouse_override: Option<bool>) -> Result<(), S
         if last_refresh.elapsed() >= Duration::from_secs(1) {
             state.refresh();
             last_refresh = Instant::now();
+            dirty = true;
         }
         let poll_wait = Duration::from_millis(100);
         match event::poll(poll_wait) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) => state.handle_key(key, &mut terminal),
-                Ok(Event::Mouse(mouse)) => state.handle_mouse(mouse, &mut terminal),
-                Ok(Event::Paste(text)) => match state.focus {
-                    Focus::Url => state.url_input.insert_str(&text),
-                    Focus::Filter => {
-                        state.filter_input.insert_str(&text);
-                        state.rebuild_visible();
+                Ok(Event::Key(key)) => {
+                    state.handle_key(key, &mut terminal);
+                    dirty = true;
+                }
+                Ok(Event::Mouse(mouse)) => {
+                    state.handle_mouse(mouse, &mut terminal);
+                    dirty = true;
+                }
+                Ok(Event::Paste(text)) => {
+                    match state.focus {
+                        Focus::Url => state.url_input.insert_str(&text),
+                        Focus::Filter => {
+                            state.filter_input.insert_str(&text);
+                            state.rebuild_visible();
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                    dirty = true;
+                }
+                Ok(Event::Resize(_, _)) => {
+                    dirty = true;
+                }
                 Ok(_) => {}
                 Err(err) => break Err(err.to_string()),
             },
@@ -1510,9 +1541,9 @@ pub fn run_tui(server_url: String, mouse_override: Option<bool>) -> Result<(), S
     let _ = execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
-        LeaveAlternateScreen
+        LeaveAlternateScreen,
+        Show
     );
-    let _ = terminal.show_cursor();
     run_res
 }
 
