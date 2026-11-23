@@ -24,7 +24,16 @@ web_port = 8780
 
 yt_dlp_command = [
     "yt-dlp",
-    "--download-archive", ".archive"
+    "--download-archive", ".archive",
+    "--mtime",
+    "--restrict-filenames",
+    "--trim-filenames", "180",
+    "--output", "%(title).100B-[%(id)s].%(ext)s",
+    "--format", "bestvideo*[vcodec!=none]+bestaudio/best[vcodec!=none]",
+    "--format-sort-force",
+    "--format-sort", "res",
+    "--merge-output-format", "mp4",
+    "--remux-video", "mp4"
 ]
 "#;
 
@@ -67,6 +76,21 @@ impl Default for Config {
                 "yt-dlp".to_string(),
                 "--download-archive".to_string(),
                 ".archive".to_string(),
+                "--mtime".to_string(),
+                "--restrict-filenames".to_string(),
+                "--trim-filenames".to_string(),
+                "180".to_string(),
+                "--output".to_string(),
+                "%(title).100B-[%(id)s].%(ext)s".to_string(),
+                "--format".to_string(),
+                "bestvideo*[vcodec!=none]+bestaudio/best[vcodec!=none]".to_string(),
+                "--format-sort-force".to_string(),
+                "--format-sort".to_string(),
+                "res".to_string(),
+                "--merge-output-format".to_string(),
+                "mp4".to_string(),
+                "--remux-video".to_string(),
+                "mp4".to_string(),
             ],
         }
     }

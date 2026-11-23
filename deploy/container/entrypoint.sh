@@ -36,7 +36,16 @@ web_port = 8780
 
 yt_dlp_command = [
     "yt-dlp",
-    "--download-archive", ".archive"
+    "--download-archive", ".archive",
+    "--mtime",
+    "--restrict-filenames",
+    "--trim-filenames", "180",
+    "--output", "%(title).100B-[%(id)s].%(ext)s",
+    "--format", "bestvideo*[vcodec!=none]+bestaudio/best[vcodec!=none]",
+    "--format-sort-force",
+    "--format-sort", "res",
+    "--merge-output-format", "mp4",
+    "--remux-video", "mp4"
 ]
 EOF
 fi
