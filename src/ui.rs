@@ -1,5 +1,6 @@
-//! Ratatui + Crossterm terminal UI with mouse support, live filtering,
-//! sorting, optional log tail panel, and clean terminal restoration.
+//! Ratatui + Crossterm terminal UI with btop/homestack-style border-integrated
+//! hotkeys, mouse support, live filtering, sorting, optional log tail panel,
+//! and clean terminal restoration.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Stdout};
@@ -30,10 +31,13 @@ use crate::domain::format_age;
 use crate::repository::{SourceRepository, normalize_url};
 use crate::state::{AppSnapshot, SourceSnapshot, apply_action, snapshot};
 
-const BORDER_UNFOCUSED: Color = Color::Rgb(0x4a, 0x55, 0x68);
-const MUTED: Color = Color::Rgb(0x88, 0x99, 0xaa);
-const MSG_COLOR: Color = Color::Rgb(0x66, 0xbb, 0xee);
-const ROW_HIGHLIGHT_BG: Color = Color::Rgb(0x24, 0x34, 0x47);
+const BORDER_FOCUSED: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
+const BORDER_UNFOCUSED: Color = Color::Rgb(0x41, 0x48, 0x68);
+const HOTKEY_COLOR: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+const TEXT_PRIMARY: Color = Color::Rgb(0xc0, 0xca, 0xf5);
+const MUTED: Color = Color::Rgb(0x6c, 0x76, 0x93);
+const MSG_COLOR: Color = Color::Rgb(0x7d, 0xcf, 0xff);
+const ROW_HIGHLIGHT_BG: Color = Color::Rgb(0x24, 0x2b, 0x3d);
 const LOG_TAIL_LINES: usize = 8;
 
 fn terminal_text(value: &str) -> String {
@@ -52,17 +56,17 @@ fn state_style(state: &str) -> Style {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
         "finishing" => Style::default().fg(Color::Magenta),
-        "active" => Style::default().fg(Color::Green),
-        _ => Style::default().fg(Color::DarkGray),
+        "active" => Style::default().fg(Color::Rgb(0x73, 0xda, 0xca)),
+        _ => Style::default().fg(MUTED),
     }
 }
 
 fn service_style(service: &str) -> Style {
     match service.to_ascii_lowercase().as_str() {
-        "tiktok" => Style::default().fg(Color::LightMagenta),
-        "youtube" => Style::default().fg(Color::LightRed),
-        "instagram" => Style::default().fg(Color::LightYellow),
-        _ => Style::default().fg(Color::LightBlue),
+        "tiktok" => Style::default().fg(Color::Rgb(0xbb, 0x9a, 0xf7)),
+        "youtube" => Style::default().fg(HOTKEY_COLOR),
+        "instagram" => Style::default().fg(Color::Rgb(0xe0, 0xaf, 0x68)),
+        _ => Style::default().fg(MSG_COLOR),
     }
 }
 
@@ -108,11 +112,13 @@ struct ButtonHit {
 #[derive(Debug, Clone, Copy)]
 enum ButtonAction {
     FocusUrl,
+    ClearUrl,
     DownloadNow,
     Disable,
     CycleSort,
     FocusFilter,
     ToggleLog,
+    ToggleMouse,
     Refresh,
     Detach,
     Quit,
@@ -120,11 +126,138 @@ enum ButtonAction {
     CancelDisable,
 }
 
+/// Helper for building btop/homestack-style border titles with `┐`...`┌` (top)
+/// or `┘`...`└` (bottom) pills and clickable hit rects.
+struct BorderPills {
+    spans: Vec<Span<'static>>,
+    x: u16,
+    y: u16,
+    border_style: Style,
+    top: bool,
+}
+
+impl BorderPills {
+    fn new(area_x: u16, y: u16, border_color: Color, top: bool) -> Self {
+        Self {
+            spans: Vec::new(),
+            x: area_x.saturating_add(1), // after left corner
+            y,
+            border_style: Style::default().fg(border_color),
+            top,
+        }
+    }
+
+    fn open_cap(&self) -> &'static str {
+        if self.top { "┐" } else { "┘" }
+    }
+
+    fn close_cap(&self) -> &'static str {
+        if self.top { "┌" } else { "└" }
+    }
+
+    fn push_pill(
+        &mut self,
+        content: Vec<Span<'static>>,
+        action: Option<ButtonAction>,
+        hits: &mut Vec<ButtonHit>,
+    ) {
+        let open = self.open_cap();
+        let close = self.close_cap();
+        let content_width: usize = content.iter().map(|s| s.content.chars().count()).sum();
+        self.spans.push(Span::styled(open, self.border_style));
+        let pill_x = self.x.saturating_add(1);
+        for span in content {
+            self.spans.push(span);
+        }
+        self.spans.push(Span::styled(close, self.border_style));
+        if let Some(act) = action {
+            hits.push(ButtonHit {
+                rect: Rect {
+                    x: pill_x,
+                    y: self.y,
+                    width: content_width as u16,
+                    height: 1,
+                },
+                action: act,
+            });
+        }
+        self.x = self.x.saturating_add((content_width + 2) as u16);
+    }
+
+    /// Pill where the hotkey is the prefix of the label (e.g., `f` + `ilter`).
+    fn push_hotkey_word(
+        &mut self,
+        key: &'static str,
+        rest: &'static str,
+        active: bool,
+        action: ButtonAction,
+        hits: &mut Vec<ButtonHit>,
+    ) {
+        let text_style = if active {
+            Style::default()
+                .fg(BORDER_FOCUSED)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT_PRIMARY)
+        };
+        self.push_pill(
+            vec![
+                Span::styled(
+                    key,
+                    Style::default()
+                        .fg(HOTKEY_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest, text_style),
+            ],
+            Some(action),
+            hits,
+        );
+    }
+
+    /// Pill where the hotkey is separate from the label (e.g., `F5` + ` refresh`).
+    fn push_key_label(
+        &mut self,
+        key: &'static str,
+        label: String,
+        action: Option<ButtonAction>,
+        hits: &mut Vec<ButtonHit>,
+    ) {
+        self.push_pill(
+            vec![
+                Span::styled(
+                    key,
+                    Style::default()
+                        .fg(HOTKEY_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {label}"), Style::default().fg(TEXT_PRIMARY)),
+            ],
+            action,
+            hits,
+        );
+    }
+
+    fn finish(self) -> Line<'static> {
+        Line::from(self.spans)
+    }
+}
+
+fn right_pill(content: Vec<Span<'static>>, border_color: Color, top: bool) -> Line<'static> {
+    let border_style = Style::default().fg(border_color);
+    let (open, close) = if top { ("┐", "┌") } else { ("┘", "└") };
+    let mut spans = Vec::with_capacity(content.len() + 2);
+    spans.push(Span::styled(open, border_style));
+    spans.extend(content);
+    spans.push(Span::styled(close, border_style));
+    Line::from(spans)
+}
+
 /// UTF-8 safe single-line text input with cursor movement.
 #[derive(Debug, Default, Clone)]
 struct TextInput {
     text: String,
-    cursor: usize, // char index
+    cursor: usize,
 }
 
 impl TextInput {
@@ -219,7 +352,10 @@ impl TextInput {
 
     fn render_with_cursor(&self, show_cursor: bool) -> Line<'static> {
         if !show_cursor {
-            return Line::from(terminal_text(&self.text));
+            return Line::from(Span::styled(
+                terminal_text(&self.text),
+                Style::default().fg(TEXT_PRIMARY),
+            ));
         }
         let idx = self.byte_index();
         let before = terminal_text(&self.text[..idx]);
@@ -237,15 +373,15 @@ impl TextInput {
         );
         let after = terminal_text(chars.as_str());
         Line::from(vec![
-            Span::raw(before),
+            Span::styled(before, Style::default().fg(TEXT_PRIMARY)),
             Span::styled(
                 under,
                 Style::default()
-                    .bg(Color::Cyan)
+                    .bg(BORDER_FOCUSED)
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(after),
+            Span::styled(after, Style::default().fg(TEXT_PRIMARY)),
         ])
     }
 }
@@ -347,7 +483,7 @@ struct TuiState {
     log_lines: Vec<String>,
     selected: Option<String>,
     confirm_id: Option<String>,
-    message: String,
+    message: Option<String>,
     message_is_error: bool,
     mouse_enabled: bool,
     focus: Focus,
@@ -380,8 +516,7 @@ impl TuiState {
             log_lines: Vec::new(),
             selected: None,
             confirm_id: None,
-            message: "Press 'a' to add a URL, '/' to filter, 's' to sort, 'l' for live log."
-                .to_string(),
+            message: None,
             message_is_error: false,
             mouse_enabled,
             focus: Focus::Table,
@@ -396,12 +531,12 @@ impl TuiState {
     }
 
     fn set_info(&mut self, msg: impl Into<String>) {
-        self.message = msg.into();
+        self.message = Some(msg.into());
         self.message_is_error = false;
     }
 
     fn set_error(&mut self, msg: impl Into<String>) {
-        self.message = msg.into();
+        self.message = Some(msg.into());
         self.message_is_error = true;
     }
 
@@ -553,13 +688,22 @@ impl TuiState {
     fn cycle_sort(&mut self) {
         self.sort_mode = self.sort_mode.next();
         self.rebuild_visible();
-        self.set_info(format!("Sorted by: {}", self.sort_mode.label()));
+        self.set_info(format!("Sort: {}", self.sort_mode.label()));
     }
 
     fn toggle_log(&mut self) {
         self.show_log = !self.show_log;
         if self.show_log {
             self.log_lines = read_log_tail(&self.log_file, LOG_TAIL_LINES);
+        }
+    }
+
+    fn toggle_mouse(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        self.mouse_enabled = !self.mouse_enabled;
+        if self.mouse_enabled {
+            let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+        } else {
+            let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
         }
     }
 
@@ -578,7 +722,11 @@ impl TuiState {
         }
     }
 
-    fn handle_button(&mut self, action: ButtonAction) {
+    fn handle_button(
+        &mut self,
+        action: ButtonAction,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) {
         match action {
             ButtonAction::FocusUrl => {
                 if self.focus == Focus::Url && !self.url_input.is_empty() {
@@ -587,11 +735,16 @@ impl TuiState {
                     self.focus = Focus::Url;
                 }
             }
+            ButtonAction::ClearUrl => {
+                self.url_input.clear();
+                self.focus = Focus::Url;
+            }
             ButtonAction::DownloadNow => self.trigger_download(),
             ButtonAction::Disable => self.ask_disable(),
             ButtonAction::CycleSort => self.cycle_sort(),
             ButtonAction::FocusFilter => self.focus = Focus::Filter,
             ButtonAction::ToggleLog => self.toggle_log(),
+            ButtonAction::ToggleMouse => self.toggle_mouse(terminal),
             ButtonAction::Refresh => {
                 self.refresh();
                 self.set_info("Refreshed.");
@@ -607,7 +760,6 @@ impl TuiState {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        // Global shortcuts
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c'))
         {
@@ -616,38 +768,25 @@ impl TuiState {
         }
         match key.code {
             KeyCode::F(2) => {
-                self.mouse_enabled = !self.mouse_enabled;
-                if self.mouse_enabled {
-                    let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
-                } else {
-                    let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
-                }
+                self.toggle_mouse(terminal);
+                return;
+            }
+            KeyCode::F(5) => {
+                self.refresh();
+                self.set_info("Refreshed.");
                 return;
             }
             KeyCode::F(6) => {
                 self.detach();
                 return;
             }
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::BackTab => {
                 if self.focus == Focus::Confirm {
                     return;
                 }
                 self.focus = match self.focus {
                     Focus::Table => Focus::Url,
-                    Focus::Url => Focus::Table,
-                    Focus::Filter => Focus::Table,
-                    Focus::Confirm => Focus::Confirm,
-                };
-                return;
-            }
-            KeyCode::BackTab => {
-                if self.focus == Focus::Confirm {
-                    return;
-                }
-                self.focus = match self.focus {
-                    Focus::Table => Focus::Url,
-                    Focus::Url => Focus::Table,
-                    Focus::Filter => Focus::Table,
+                    Focus::Url | Focus::Filter => Focus::Table,
                     Focus::Confirm => Focus::Confirm,
                 };
                 return;
@@ -719,6 +858,8 @@ impl TuiState {
                 _ => {}
             },
             Focus::Table => match key.code {
+                KeyCode::Char('1') => self.focus = Focus::Url,
+                KeyCode::Char('2') => self.focus = Focus::Table,
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 KeyCode::PageUp => self.move_selection(-10),
@@ -727,7 +868,7 @@ impl TuiState {
                 KeyCode::End | KeyCode::Char('G') => self.select_last(),
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('a') => self.focus = Focus::Url,
-                KeyCode::Char('/') => self.focus = Focus::Filter,
+                KeyCode::Char('/') | KeyCode::Char('f') => self.focus = Focus::Filter,
                 KeyCode::Char('s') => self.cycle_sort(),
                 KeyCode::Char('l') => self.toggle_log(),
                 KeyCode::Char('n') => self.trigger_download(),
@@ -746,7 +887,11 @@ impl TuiState {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.move_selection(-3),
             MouseEventKind::ScrollDown => self.move_selection(3),
@@ -755,7 +900,7 @@ impl TuiState {
                 let row = mouse.row;
                 for btn in &self.buttons.clone() {
                     if rect_contains(btn.rect, col, row) {
-                        self.handle_button(btn.action);
+                        self.handle_button(btn.action, terminal);
                         return;
                     }
                 }
@@ -769,7 +914,6 @@ impl TuiState {
                     return;
                 }
                 if rect_contains(self.table_area, col, row) {
-                    // Inside bordered table: top border (+1) and header row (+1) = +2.
                     let first_row_y = self.table_area.y.saturating_add(2);
                     let bottom_y = self.table_area.y + self.table_area.height.saturating_sub(1);
                     if row >= first_row_y && row < bottom_y {
@@ -813,239 +957,190 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
 
     let mut constraints = vec![
-        Constraint::Length(1), // header
-        Constraint::Length(3), // url / filter input box
-        Constraint::Length(1), // compact action bar
-        Constraint::Min(5),    // sources table
+        Constraint::Length(3), // ¹vdl / URL or Filter input panel
+        Constraint::Min(5),    // ²sources panel
     ];
     if state.show_log {
         constraints.push(Constraint::Length((LOG_TAIL_LINES + 2) as u16));
     }
-    constraints.push(Constraint::Length(1)); // footer / message
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
 
-    render_header(frame, chunks[0], state);
-    render_input_box(frame, chunks[1], state);
-    render_action_bar(frame, chunks[2], state);
-    render_table(frame, chunks[3], state);
-
-    let footer_idx = if state.show_log {
-        render_log_panel(frame, chunks[4], state);
-        5
-    } else {
-        4
-    };
-    render_footer(frame, chunks[footer_idx], state);
-
+    render_top_panel(frame, chunks[0], state);
+    render_sources_panel(frame, chunks[1], state);
+    if state.show_log {
+        render_log_panel(frame, chunks[2], state);
+    }
     if state.confirm_id.is_some() {
         render_confirm_modal(frame, area, state);
     }
 }
 
-fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+fn render_top_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
+    state.input_area = area;
+    let is_filter = state.focus == Focus::Filter;
+    let is_url = state.focus == Focus::Url;
+    let border_color = if is_filter {
+        Color::Yellow
+    } else if is_url {
+        BORDER_FOCUSED
+    } else {
+        BORDER_UNFOCUSED
+    };
+
+    let mut top = BorderPills::new(area.x, area.y, border_color, true);
+    top.push_pill(
+        vec![
+            Span::styled(
+                "¹",
+                Style::default()
+                    .fg(HOTKEY_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if is_filter { "filter" } else { "vdl" },
+                Style::default()
+                    .fg(TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ],
+        Some(ButtonAction::FocusUrl),
+        &mut state.buttons,
+    );
+
+    if is_filter {
+        top.push_key_label("ENTER", "browse".to_string(), None, &mut state.buttons);
+        top.push_key_label("ESC", "clear".to_string(), None, &mut state.buttons);
+    } else {
+        top.push_hotkey_word(
+            "a",
+            "dd",
+            is_url,
+            ButtonAction::FocusUrl,
+            &mut state.buttons,
+        );
+        if !state.url_input.is_empty() {
+            top.push_key_label(
+                "Ctrl-U",
+                "clear".to_string(),
+                Some(ButtonAction::ClearUrl),
+                &mut state.buttons,
+            );
+        }
+        top.push_hotkey_word(
+            "l",
+            "og",
+            state.show_log,
+            ButtonAction::ToggleLog,
+            &mut state.buttons,
+        );
+    }
+
     let total = state.snapshot.sources.len();
     let active = state.snapshot.sources.iter().filter(|s| s.active).count();
-    let (status_span, counts_span) = if let Some(ref busy) = state.snapshot.download {
-        (
+    let status_spans = if let Some(ref busy) = state.snapshot.download {
+        vec![
             Span::styled(
-                format!(" ⬇ Downloading {} ", terminal_text(busy)),
+                format!("⬇ {} ", terminal_text(busy)),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
-                    "│ {total} sources ({active} active, {} pending)",
-                    state.snapshot.pending
-                ),
+                format!("· {} pending", state.snapshot.pending),
                 Style::default().fg(MUTED),
             ),
-        )
+        ]
     } else if state.snapshot.owner_running {
-        (
-            Span::styled(
-                " ● Ready ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
+        vec![
+            Span::styled("● ", Style::default().fg(Color::Rgb(0x73, 0xda, 0xca))),
+            Span::styled("ready ", Style::default().fg(TEXT_PRIMARY)),
             Span::styled(
                 format!(
-                    "│ {total} sources ({active} active, {} pending)",
+                    "· {active}/{total} active · {} pending",
                     state.snapshot.pending
                 ),
                 Style::default().fg(MUTED),
             ),
-        )
+        ]
     } else {
-        (
+        vec![
+            Span::styled("■ ", Style::default().fg(HOTKEY_COLOR)),
+            Span::styled("stopped ", Style::default().fg(HOTKEY_COLOR)),
             Span::styled(
-                " ■ Downloader stopped ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("│ {total} sources ({active} active)"),
+                format!("· {active}/{total} active"),
                 Style::default().fg(MUTED),
             ),
-        )
+        ]
     };
 
-    let left = Line::from(vec![
-        Span::styled(
-            " vdl ",
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        status_span,
-        counts_span,
-    ]);
-    frame.render_widget(Paragraph::new(left), area);
-
-    let right = Line::from(vec![
-        Span::styled(
-            format!("Sort: {} ", state.sort_mode.label()),
-            Style::default().fg(MUTED),
-        ),
-        Span::styled(
-            format!(
-                "│ Mouse: {} ",
-                if state.mouse_enabled { "ON" } else { "OFF" }
-            ),
-            Style::default().fg(if state.mouse_enabled {
-                Color::Cyan
-            } else {
-                MUTED
-            }),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
-}
-
-fn render_input_box(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
-    state.input_area = area;
-    if state.focus == Focus::Filter {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" Filter (Enter: browse, Esc: clear) ");
-        let inner = state.filter_input.render_with_cursor(true);
-        frame.render_widget(Paragraph::new(inner).block(block), area);
-        return;
-    }
-
-    let focused = state.focus == Focus::Url;
-    let border_color = if focused {
-        Color::Cyan
-    } else {
-        BORDER_UNFOCUSED
-    };
-    let bottom_title = if state.url_input.is_empty() {
-        Span::styled(
-            " Paste profile/channel URL (query string stripped) ",
-            Style::default().fg(MUTED),
-        )
-    } else {
-        match normalize_url(state.url_input.as_str()) {
-            Ok(clean) => Span::styled(
-                format!(" Will save: {} ", terminal_text(&clean)),
-                Style::default().fg(Color::Green),
-            ),
-            Err(err) => Span::styled(
-                format!(" {} ", terminal_text(&err.to_string())),
-                Style::default().fg(Color::Red),
-            ),
-        }
-    };
-
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .title(if focused {
-            " Add URL (Enter: add, Ctrl-U: clear, Esc: table) "
-        } else {
-            " Add URL [a] "
-        })
-        .title_bottom(Line::from(bottom_title).alignment(Alignment::Left));
+        .title_top(top.finish())
+        .title_top(right_pill(status_spans, border_color, true).alignment(Alignment::Right));
 
-    let content = if state.url_input.is_empty() && !focused {
-        Line::from(Span::styled(
-            "https://...",
-            Style::default().fg(Color::DarkGray),
-        ))
+    // Bottom border of top panel shows normalized URL preview or status message
+    if !is_filter && !state.url_input.is_empty() {
+        let preview_span = match normalize_url(state.url_input.as_str()) {
+            Ok(clean) => Span::styled(
+                format!("→ {}", terminal_text(&clean)),
+                Style::default().fg(Color::Rgb(0x73, 0xda, 0xca)),
+            ),
+            Err(err) => Span::styled(
+                terminal_text(&err.to_string()),
+                Style::default().fg(HOTKEY_COLOR),
+            ),
+        };
+        block = block.title_bottom(right_pill(vec![preview_span], border_color, false));
+    } else if let Some(ref msg) = state.message {
+        let style = if state.message_is_error {
+            Style::default().fg(HOTKEY_COLOR)
+        } else {
+            Style::default().fg(MSG_COLOR)
+        };
+        block = block.title_bottom(
+            right_pill(
+                vec![Span::styled(terminal_text(msg), style)],
+                border_color,
+                false,
+            )
+            .alignment(Alignment::Right),
+        );
+    }
+
+    let content = if is_filter {
+        let mut line = vec![Span::styled("/ ", Style::default().fg(Color::Yellow))];
+        line.extend(state.filter_input.render_with_cursor(true).spans);
+        Line::from(line)
+    } else if state.url_input.is_empty() && !is_url {
+        Line::from(vec![
+            Span::styled("URL: ", Style::default().fg(MUTED)),
+            Span::styled(
+                "press 'a' or click to paste a profile/channel URL (query stripped)",
+                Style::default().fg(MUTED),
+            ),
+        ])
     } else {
-        state.url_input.render_with_cursor(focused)
+        let mut line = vec![Span::styled(
+            "URL: ",
+            Style::default().fg(if is_url { BORDER_FOCUSED } else { MUTED }),
+        )];
+        line.extend(state.url_input.render_with_cursor(is_url).spans);
+        Line::from(line)
     };
+
     frame.render_widget(Paragraph::new(content).block(block), area);
 }
 
-fn render_action_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
-    let items: &[(&str, &str, ButtonAction)] = &[
-        ("a", "Add", ButtonAction::FocusUrl),
-        ("n", "Now", ButtonAction::DownloadNow),
-        ("d", "Disable", ButtonAction::Disable),
-        ("s", "Sort", ButtonAction::CycleSort),
-        ("/", "Filter", ButtonAction::FocusFilter),
-        ("l", "Log", ButtonAction::ToggleLog),
-        ("r", "Refresh", ButtonAction::Refresh),
-        ("F6", "Detach", ButtonAction::Detach),
-        ("q", "Quit", ButtonAction::Quit),
-    ];
-
-    let mut x = area.x;
-    let mut spans = Vec::new();
-    for (i, &(key, label, action)) in items.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-            x = x.saturating_add(2);
-        }
-        let key_part = format!("[{key}]");
-        let text_part = format!(" {label}");
-        let w = (key_part.len() + text_part.len()) as u16;
-        state.buttons.push(ButtonHit {
-            rect: Rect {
-                x,
-                y: area.y,
-                width: w,
-                height: 1,
-            },
-            action,
-        });
-        let active_toggle = matches!(action, ButtonAction::ToggleLog) && state.show_log;
-        spans.push(Span::styled(
-            key_part,
-            Style::default()
-                .fg(if active_toggle {
-                    Color::Yellow
-                } else {
-                    Color::Cyan
-                })
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            text_part,
-            Style::default().fg(if active_toggle {
-                Color::Yellow
-            } else {
-                Color::White
-            }),
-        ));
-        x = x.saturating_add(w);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
+fn render_sources_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
     state.table_area = area;
     let focused = state.focus == Focus::Table;
     let border_color = if focused {
-        Color::Cyan
+        BORDER_FOCUSED
     } else {
         BORDER_UNFOCUSED
     };
@@ -1053,29 +1148,128 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState
     let visible_len = state.visible.len();
     let total_len = state.snapshot.sources.len();
     let pos = state.selected_index().map_or(0, |i| i + 1);
-    let mut title = if state.filter_input.is_empty() {
-        format!(" Sources ({pos}/{visible_len}) ")
-    } else {
-        format!(
-            " Sources ({pos}/{visible_len} of {total_len}) [filter: \"{}\"] ",
-            terminal_text(state.filter_input.as_str())
-        )
-    };
-    if visible_len == 0 {
-        title = if state.filter_input.is_empty() {
-            " Sources (0) ".to_string()
-        } else {
-            format!(
-                " Sources (0 of {total_len}) [filter: \"{}\"] ",
-                terminal_text(state.filter_input.as_str())
-            )
-        };
-    }
 
-    let block = Block::bordered()
+    let mut top = BorderPills::new(area.x, area.y, border_color, true);
+    top.push_pill(
+        vec![
+            Span::styled(
+                "²",
+                Style::default()
+                    .fg(HOTKEY_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "sources",
+                Style::default()
+                    .fg(TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ],
+        None,
+        &mut state.buttons,
+    );
+    top.push_hotkey_word(
+        "f",
+        "ilter",
+        !state.filter_input.is_empty() || state.focus == Focus::Filter,
+        ButtonAction::FocusFilter,
+        &mut state.buttons,
+    );
+    top.push_pill(
+        vec![
+            Span::styled(
+                "s",
+                Style::default()
+                    .fg(HOTKEY_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("ort ", Style::default().fg(TEXT_PRIMARY)),
+            Span::styled(
+                format!("< {} >", state.sort_mode.label()),
+                Style::default()
+                    .fg(BORDER_FOCUSED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ],
+        Some(ButtonAction::CycleSort),
+        &mut state.buttons,
+    );
+    top.push_hotkey_word(
+        "n",
+        "ow",
+        false,
+        ButtonAction::DownloadNow,
+        &mut state.buttons,
+    );
+    top.push_hotkey_word(
+        "d",
+        "isable",
+        false,
+        ButtonAction::Disable,
+        &mut state.buttons,
+    );
+
+    let bottom_y = area.y + area.height.saturating_sub(1);
+    let mut bottom = BorderPills::new(area.x, bottom_y, border_color, false);
+    bottom.push_key_label("↑↓", "select".to_string(), None, &mut state.buttons);
+    bottom.push_key_label(
+        "F2",
+        format!("mouse {}", if state.mouse_enabled { "on" } else { "off" }),
+        Some(ButtonAction::ToggleMouse),
+        &mut state.buttons,
+    );
+    bottom.push_key_label(
+        "F5",
+        "refresh".to_string(),
+        Some(ButtonAction::Refresh),
+        &mut state.buttons,
+    );
+    bottom.push_key_label(
+        "F6",
+        "detach".to_string(),
+        Some(ButtonAction::Detach),
+        &mut state.buttons,
+    );
+    bottom.push_hotkey_word("q", "uit", false, ButtonAction::Quit, &mut state.buttons);
+
+    let count_text = if visible_len == 0 {
+        format!("0/{total_len}")
+    } else if state.filter_input.is_empty() {
+        format!("{pos}/{visible_len}")
+    } else {
+        format!("{pos}/{visible_len} of {total_len}")
+    };
+
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .title(title);
+        .title_top(top.finish())
+        .title_bottom(bottom.finish())
+        .title_bottom(
+            right_pill(
+                vec![Span::styled(count_text, Style::default().fg(TEXT_PRIMARY))],
+                border_color,
+                false,
+            )
+            .alignment(Alignment::Right),
+        );
+
+    if !state.filter_input.is_empty() {
+        block = block.title_top(
+            right_pill(
+                vec![
+                    Span::styled("filter: ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        terminal_text(state.filter_input.as_str()),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ],
+                border_color,
+                true,
+            )
+            .alignment(Alignment::Right),
+        );
+    }
 
     if state.visible.is_empty() {
         let empty_msg = if state.filter_input.is_empty() {
@@ -1094,12 +1288,11 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState
 
     let wide = area.width >= 72;
     let header_cells: Vec<&str> = if wide {
-        vec!["", "#", "Service", "Account", "Last attempt", "State"]
+        vec!["", "#", "SERVICE", "ACCOUNT", "LAST ATTEMPT", "STATE"]
     } else {
-        vec!["", "#", "Service", "Account", "State"]
+        vec!["", "#", "SERVICE", "ACCOUNT", "STATE"]
     };
-    let header =
-        Row::new(header_cells).style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD));
+    let header = Row::new(header_cells).style(Style::default().fg(MUTED));
 
     let selected_id = state.selected.as_deref();
     let rows: Vec<Row<'_>> = state
@@ -1111,16 +1304,16 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState
             let marker = if is_selected {
                 Cell::from("▸").style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(BORDER_FOCUSED)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
                 Cell::from(" ")
             };
             let account_style = if row.active {
-                Style::default()
+                Style::default().fg(TEXT_PRIMARY)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(MUTED)
             };
             let mut cells = vec![
                 marker,
@@ -1168,14 +1361,14 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState
 
     frame.render_stateful_widget(table, area, &mut state.table_state);
 
-    // Render vertical scrollbar on the right border
     let mut scrollbar_state =
         ScrollbarState::new(visible_len).position(state.selected_index().unwrap_or(0));
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(Some("▲"))
-        .end_symbol(Some("▼"))
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
         .track_symbol(Some("│"))
-        .thumb_symbol("█");
+        .thumb_symbol("█")
+        .style(Style::default().fg(MUTED));
     let scroll_area = Rect {
         x: area.x,
         y: area.y.saturating_add(1),
@@ -1185,12 +1378,50 @@ fn render_table(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState
     frame.render_stateful_widget(scrollbar, scroll_area, &mut scrollbar_state);
 }
 
-fn render_log_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    let title = format!(" Live Log ({}) [l to hide] ", state.log_file.display());
+fn render_log_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
+    let border_color = BORDER_UNFOCUSED;
+    let mut top = BorderPills::new(area.x, area.y, border_color, true);
+    top.push_pill(
+        vec![
+            Span::styled(
+                "³",
+                Style::default()
+                    .fg(HOTKEY_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "log",
+                Style::default()
+                    .fg(TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ],
+        None,
+        &mut state.buttons,
+    );
+    top.push_key_label(
+        "l",
+        "hide".to_string(),
+        Some(ButtonAction::ToggleLog),
+        &mut state.buttons,
+    );
+
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER_UNFOCUSED))
-        .title(title);
+        .border_style(Style::default().fg(border_color))
+        .title_top(top.finish())
+        .title_top(
+            right_pill(
+                vec![Span::styled(
+                    state.log_file.display().to_string(),
+                    Style::default().fg(MUTED),
+                )],
+                border_color,
+                true,
+            )
+            .alignment(Alignment::Right),
+        );
+
     let lines: Vec<Line<'_>> = state
         .log_lines
         .iter()
@@ -1199,43 +1430,50 @@ fn render_log_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    let msg_style = if state.message_is_error {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(MSG_COLOR)
-    };
-    frame.render_widget(
-        Paragraph::new(terminal_text(&state.message)).style(msg_style),
-        area,
-    );
-    frame.render_widget(
-        Paragraph::new("Tab: focus  j/k/↑↓: nav  F2: mouse  Ctrl-Q: quit")
-            .style(Style::default().fg(MUTED))
-            .alignment(Alignment::Right),
-        area,
-    );
-}
-
 fn render_confirm_modal(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiState) {
     let popup = centered_rect(58, 7, area);
     frame.render_widget(Clear, popup);
 
+    let border_color = Color::Yellow;
+    let mut top = BorderPills::new(popup.x, popup.y, border_color, true);
+    top.push_pill(
+        vec![Span::styled(
+            "confirm disable",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )],
+        None,
+        &mut state.buttons,
+    );
+
+    let bottom_y = popup.y + popup.height.saturating_sub(1);
+    let mut bottom = BorderPills::new(popup.x, bottom_y, border_color, false);
+    bottom.push_key_label(
+        "ENTER/y",
+        "confirm".to_string(),
+        Some(ButtonAction::ConfirmDisable),
+        &mut state.buttons,
+    );
+    bottom.push_key_label(
+        "ESC/n",
+        "cancel".to_string(),
+        Some(ButtonAction::CancelDisable),
+        &mut state.buttons,
+    );
+
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(" Confirm Disable ");
+        .border_style(Style::default().fg(border_color))
+        .title_top(top.finish())
+        .title_bottom(bottom.finish());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
     let cid = state.confirm_id.as_deref().unwrap_or("");
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
 
     frame.render_widget(
@@ -1254,46 +1492,6 @@ fn render_confirm_modal(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
         rows[1],
-    );
-
-    let confirm_label = "[ Confirm (y) ]";
-    let cancel_label = "[ Cancel (n) ]";
-    let total_w = (confirm_label.len() + 3 + cancel_label.len()) as u16;
-    let start_x = rows[2].x + rows[2].width.saturating_sub(total_w) / 2;
-
-    state.buttons.push(ButtonHit {
-        rect: Rect {
-            x: start_x,
-            y: rows[2].y,
-            width: confirm_label.len() as u16,
-            height: 1,
-        },
-        action: ButtonAction::ConfirmDisable,
-    });
-    state.buttons.push(ButtonHit {
-        rect: Rect {
-            x: start_x + confirm_label.len() as u16 + 3,
-            y: rows[2].y,
-            width: cancel_label.len() as u16,
-            height: 1,
-        },
-        action: ButtonAction::CancelDisable,
-    });
-
-    let btn_line = Line::from(vec![
-        Span::styled(
-            confirm_label,
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled(cancel_label, Style::default().fg(Color::White)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(btn_line).alignment(Alignment::Center),
-        rows[2],
     );
 }
 
@@ -1327,7 +1525,7 @@ pub fn run_tui(config: Config, mouse_override: Option<bool>) -> Result<(), Strin
         match event::poll(poll_wait) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => state.handle_key(key, &mut terminal),
-                Ok(Event::Mouse(mouse)) => state.handle_mouse(mouse),
+                Ok(Event::Mouse(mouse)) => state.handle_mouse(mouse, &mut terminal),
                 Ok(Event::Paste(text)) => match state.focus {
                     Focus::Url => state.url_input.insert_str(&text),
                     Focus::Filter => {
