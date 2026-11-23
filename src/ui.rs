@@ -1001,9 +1001,37 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, state: &mut TuiState) {
         render_log_panel(frame, chunks[2], state);
     }
     if state.confirm_id.is_some() {
+        dim_background(frame, area);
         render_confirm_modal(frame, area, state);
     } else if state.info_modal.is_some() {
+        dim_background(frame, area);
         render_info_modal(frame, area, state);
+    }
+}
+
+fn dim_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            (f32::from(r) * 0.35) as u8,
+            (f32::from(g) * 0.35) as u8,
+            (f32::from(b) * 0.35) as u8,
+        ),
+        Color::Reset => Color::Rgb(0x4a, 0x52, 0x62),
+        _ => Color::Rgb(0x45, 0x4c, 0x5c),
+    }
+}
+
+fn dim_background(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_fg(dim_color(cell.fg));
+                cell.set_bg(Color::Reset);
+                cell.modifier.remove(Modifier::BOLD | Modifier::REVERSED);
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
     }
 }
 
