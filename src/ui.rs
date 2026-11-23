@@ -245,7 +245,11 @@ impl BorderPills {
 
 fn right_pill(content: Vec<Span<'static>>, border_color: Color, top: bool) -> Line<'static> {
     let border_style = Style::default().fg(border_color);
-    let (open, close) = if top { ("┐", "┌") } else { ("┘", "└") };
+    let (open, close) = if top {
+        ("┐ ", " ┌")
+    } else {
+        ("┘ ", " └")
+    };
     let mut spans = Vec::with_capacity(content.len() + 2);
     spans.push(Span::styled(open, border_style));
     spans.extend(content);
@@ -994,6 +998,7 @@ fn render_top_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiS
     let mut top = BorderPills::new(area.x, area.y, border_color, true);
     top.push_pill(
         vec![
+            Span::raw(" "),
             Span::styled(
                 "¹",
                 Style::default()
@@ -1001,7 +1006,7 @@ fn render_top_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiS
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                if is_filter { "filter" } else { "vdl" },
+                if is_filter { "filter " } else { "vdl " },
                 Style::default()
                     .fg(TEXT_PRIMARY)
                     .add_modifier(Modifier::BOLD),
@@ -1152,6 +1157,7 @@ fn render_sources_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
     let mut top = BorderPills::new(area.x, area.y, border_color, true);
     top.push_pill(
         vec![
+            Span::raw(" "),
             Span::styled(
                 "²",
                 Style::default()
@@ -1159,7 +1165,7 @@ fn render_sources_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "sources",
+                "sources ",
                 Style::default()
                     .fg(TEXT_PRIMARY)
                     .add_modifier(Modifier::BOLD),
@@ -1383,6 +1389,7 @@ fn render_log_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiS
     let mut top = BorderPills::new(area.x, area.y, border_color, true);
     top.push_pill(
         vec![
+            Span::raw(" "),
             Span::styled(
                 "³",
                 Style::default()
@@ -1390,7 +1397,7 @@ fn render_log_panel(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut TuiS
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "log",
+                "log ",
                 Style::default()
                     .fg(TEXT_PRIMARY)
                     .add_modifier(Modifier::BOLD),
@@ -1438,7 +1445,7 @@ fn render_confirm_modal(frame: &mut ratatui::Frame<'_>, area: Rect, state: &mut 
     let mut top = BorderPills::new(popup.x, popup.y, border_color, true);
     top.push_pill(
         vec![Span::styled(
-            "confirm disable",
+            " confirm disable ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
