@@ -22,8 +22,4 @@ persistence:
   directories:
     - config
     - logs
-exposure:
-  pangolin:
-    port: http
-    name: VDL
-    subdomain: vdl
+exposure: {}

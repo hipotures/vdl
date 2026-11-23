@@ -5,7 +5,7 @@
 - Runtime stage: `docker.io/library/debian:bookworm-slim` with `ffmpeg`, `python3`, `ca-certificates`, `curl`, and the standalone `yt-dlp` binary.
 
 ## Ports & Endpoints
-- `8780/tcp` (plain HTTP; Pangolin terminates public HTTPS):
+- `8780/tcp` (plain HTTP, LAN-only; no public Pangolin exposure):
   - Web UI: `/`, `/app.css`, `/app.js`, `/sort.js`, `/url.js`
   - JSON API: `GET /api/state`, `GET /api/logs`, `POST /api/sources`, `POST /api/sources/disable`, `POST /api/sources/download-now`
   - HomeStack health: `GET /health/live`, `GET /health/ready` (`application/health+json`, real loopback heartbeat)
