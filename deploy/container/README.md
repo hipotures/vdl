@@ -12,10 +12,10 @@
   - HomeStack telemetry (schema 3): `GET /.well-known/homestack/status` (`application/json`, `VmRSS` from `/proc/self/status`)
 
 ## Persistence
-All durable state lives under `/home/app` (HomeStack persistent volume `mp0`):
+Config and logs live under `/home/app` (HomeStack persistent volume `mp0`):
 - `/home/app/config/config.toml` — created once on first boot if absent
-- `/home/app/downloads/` — source folders, `.source` / `.source.del`, `.archive`, `.last-check`, `.download-now`, and downloaded media
 - `/home/app/logs/vdl.log` — downloader and server log
+- `/home/app/downloads/` — default `download_root` if `VDL_DOWNLOAD_ROOT` is not set; for external/shared media mounts, pass `VDL_DOWNLOAD_ROOT` via the HomeStack `download_root` input.
 
 The entrypoint refuses to start if `/home/app` is a symlink or not a mounted volume unless `VDL_ALLOW_UNMOUNTED_HOME=1` is set for throwaway local tests.
 

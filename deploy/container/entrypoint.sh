@@ -15,7 +15,10 @@ if [ "${VDL_ALLOW_UNMOUNTED_HOME:-0}" != "1" ]; then
     fi
 fi
 
-mkdir -p "$HOME_DIR/config" "$HOME_DIR/downloads" "$HOME_DIR/logs"
+mkdir -p "$HOME_DIR/config" "$HOME_DIR/logs"
+if [ -z "${VDL_DOWNLOAD_ROOT:-}" ]; then
+    mkdir -p "$HOME_DIR/downloads"
+fi
 
 CONFIG_FILE="$HOME_DIR/config/config.toml"
 if [ ! -f "$CONFIG_FILE" ]; then

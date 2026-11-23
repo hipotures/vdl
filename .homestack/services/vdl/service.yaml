@@ -18,10 +18,9 @@ runtime:
     heartbeat_seconds: 60
 persistence:
   mount: /home/app
-  size: 20G
+  size: 1G
   directories:
     - config
-    - downloads
     - logs
 exposure:
   pangolin:

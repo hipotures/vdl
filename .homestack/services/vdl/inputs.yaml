@@ -1,3 +1,13 @@
 schema: 3
 service: vdl
-inputs: []
+inputs:
+  - id: download_root
+    label: Download root
+    description: Absolute path inside the container where source folders and downloaded media live (e.g. a shared media mount). Leave empty to use /home/app/downloads on the container home volume.
+    type: string
+    required: false
+    max_length: 1000
+    regex: '^/.+'
+    target:
+      type: environment
+      variable: VDL_DOWNLOAD_ROOT
